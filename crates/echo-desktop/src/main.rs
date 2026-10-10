@@ -1,0 +1,961 @@
+mod store;
+mod theme;
+
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver};
+use std::time::{Duration, Instant};
+
+use arboard::Clipboard;
+use echo_core::{
+    Site, SiteList, decode_secret_key, encode_secret_key, entropy_bits, fingerprint, master_key,
+    normalize, password, site_key,
+};
+use eframe::egui::{self, Align, Key, Layout, RichText, Sense, Ui};
+use store::Keys;
+use theme::icon;
+use zeroize::Zeroize;
+
+/// Content never gets wider than this; on a wide window it is centred.
+const CONTENT_WIDTH: f32 = 520.0;
+const COPIED_FLASH: Duration = Duration::from_secs(2);
+
+struct Editor {
+    /// Index in the site list when editing; `None` when adding.
+    index: Option<usize>,
+    site: String,
+    login: String,
+    counter: u32,
+    length: usize,
+    lower: bool,
+    upper: bool,
+    digits: bool,
+    symbols: bool,
+    apps: Vec<String>,
+    confirm_delete: bool,
+    focus_site: bool,
+}
+
+impl Editor {
+    fn new(index: Option<usize>, site: &Site) -> Self {
+        Self {
+            index,
+            site: site.site.clone(),
+            login: site.login.clone(),
+            counter: site.counter,
+            length: site.length,
+            lower: site.classes.contains('l'),
+            upper: site.classes.contains('u'),
+            digits: site.classes.contains('d'),
+            symbols: site.classes.contains('s'),
+            apps: site.apps.clone(),
+            confirm_delete: false,
+            focus_site: index.is_none(),
+        }
+    }
+
+    fn blank() -> Self {
+        Self::new(
+            None,
+            &Site {
+                site: String::new(),
+                login: String::new(),
+                counter: 1,
+                length: 20,
+                classes: "luds".to_string(),
+                apps: vec![],
+            },
+        )
+    }
+
+    fn classes(&self) -> String {
+        [(self.lower, 'l'), (self.upper, 'u'), (self.digits, 'd'), (self.symbols, 's')]
+            .iter()
+            .filter_map(|&(on, class)| on.then_some(class))
+            .collect()
+    }
+
+    fn to_site(&self) -> Result<Site, String> {
+        let classes = self.classes();
+        let site = normalize(&self.site);
+        if site.is_empty() {
+            return Err("Enter a site name.".to_string());
+        }
+        if classes.is_empty() {
+            return Err("Pick at least one kind of character.".to_string());
+        }
+        Ok(Site {
+            site,
+            login: normalize(&self.login),
+            counter: self.counter,
+            length: self.length,
+            classes,
+            apps: self.apps.clone(),
+        })
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Dialog {
+    Export,
+    Import,
+}
+
+#[derive(Default)]
+struct Settings {
+    reveal: bool,
+    confirm_reset: bool,
+    message: String,
+    /// A file dialog is open on another thread.
+    dialog: Option<(Dialog, Receiver<Option<PathBuf>>)>,
+}
+
+enum Screen {
+    Setup,
+    Deriving { rx: Receiver<Keys>, generated: bool },
+    /// `generated`: the secret key was made here, so it must be backed up before saving.
+    Confirm { keys: Keys, generated: bool, written_down: bool },
+    Sites,
+    Editor(Editor),
+    Settings(Settings),
+    /// Something is wrong that the app must not paper over (e.g. an unreadable site list).
+    Fatal(String),
+}
+
+struct App {
+    screen: Screen,
+    error: String,
+    mark: Option<egui::TextureHandle>,
+
+    // Setup form
+    password: String,
+    confirm: String,
+    have_secret_key: bool,
+    secret_key_text: String,
+
+    // Set once setup is done
+    keys: Option<Keys>,
+    sites: SiteList,
+    sites_path: PathBuf,
+
+    // Sites screen
+    search: String,
+    focus_search: bool,
+    selected: Option<usize>,
+    show_password: bool,
+    clipboard: Option<Clipboard>,
+    copied_at: Option<Instant>,
+}
+
+impl App {
+    fn new() -> Self {
+        Self::start(store::sites_path(), store::load_keys(store::ACCOUNT))
+    }
+
+    fn start(sites_path: PathBuf, keys: Result<Option<Keys>, String>) -> Self {
+        let mut app = Self {
+            screen: Screen::Setup,
+            error: String::new(),
+            mark: None,
+            password: String::new(),
+            confirm: String::new(),
+            have_secret_key: false,
+            secret_key_text: String::new(),
+            keys: None,
+            sites: SiteList { version: 1, sites: vec![] },
+            sites_path,
+            search: String::new(),
+            focus_search: true,
+            selected: None,
+            show_password: false,
+            clipboard: None,
+            copied_at: None,
+        };
+        match SiteList::load(&app.sites_path) {
+            Ok(sites) => app.sites = sites,
+            Err(e) => {
+                app.screen = Screen::Fatal(e);
+                return app;
+            }
+        }
+        match keys {
+            Ok(Some(keys)) => {
+                app.keys = Some(keys);
+                app.screen = Screen::Sites;
+            }
+            Ok(None) => {}
+            Err(e) => app.error = format!("Can't reach the system keyring: {e}"),
+        }
+        app
+    }
+
+    fn mark(&mut self, ui: &Ui, size: f32) -> egui::Image<'static> {
+        let texture = self.mark.get_or_insert_with(|| {
+            let image = egui::ColorImage::from_rgba_unmultiplied(
+                [96, 96],
+                include_bytes!("../../../assets/mark-96.rgba"),
+            );
+            ui.ctx().load_texture("mark", image, egui::TextureOptions::LINEAR)
+        });
+        egui::Image::new((texture.id(), egui::Vec2::splat(size)))
+    }
+
+    fn go_to_sites(&mut self) -> Screen {
+        self.error.clear();
+        self.focus_search = true;
+        Screen::Sites
+    }
+
+    // ---- Setup -------------------------------------------------------------------------------
+
+    fn setup_screen(&mut self, ui: &mut Ui) -> Option<Screen> {
+        ui.add_space(24.0);
+        ui.vertical_centered(|ui| {
+            ui.add(self.mark(ui, 64.0));
+            ui.add_space(4.0);
+            ui.heading("Set up Echo");
+            ui.label(theme::muted(
+                "One master password becomes a different password for every site. Nothing is stored.",
+            ));
+        });
+        ui.add_space(16.0);
+
+        theme::field(ui, "Master password", |ui| {
+            ui.add(theme::text_field(&mut self.password).password(true))
+        });
+        theme::field(ui, "Repeat master password", |ui| {
+            ui.add(theme::text_field(&mut self.confirm).password(true))
+        });
+        theme::checkbox(ui, &mut self.have_secret_key, "I have a secret key from another device");
+        if self.have_secret_key {
+            theme::field(ui, "Secret key", |ui| {
+                ui.add(
+                    theme::text_field(&mut self.secret_key_text)
+                        .font(egui::TextStyle::Monospace)
+                        .hint_text("52 characters, spaces optional"),
+                )
+            });
+        }
+        ui.add_space(8.0);
+        let submit = ui.add_sized([ui.available_width(), 40.0], theme::primary_button("", "Continue")).clicked()
+            || ui.input(|i| i.key_pressed(Key::Enter));
+        if !submit {
+            return None;
+        }
+
+        let secret = if self.password.is_empty() {
+            Err("Enter a master password.".to_string())
+        } else if self.password != self.confirm {
+            Err("The two passwords don't match.".to_string())
+        } else if self.have_secret_key {
+            decode_secret_key(&self.secret_key_text).ok_or("That isn't a valid secret key.".to_string())
+        } else {
+            store::random_key().map_err(|e| format!("Can't generate a secret key: {e}"))
+        };
+        let secret = match secret {
+            Ok(secret) => secret,
+            Err(e) => {
+                self.error = e;
+                return None;
+            }
+        };
+        self.error.clear();
+
+        // Argon2id takes about a second; keep it off the UI thread.
+        let (tx, rx) = mpsc::channel();
+        let mut password = std::mem::take(&mut self.password);
+        self.confirm.zeroize();
+        self.secret_key_text.zeroize();
+        let ctx = ui.ctx().clone();
+        std::thread::spawn(move || {
+            let master = master_key(&password, &secret);
+            password.zeroize();
+            let _ = tx.send(Keys { secret, master });
+            ctx.request_repaint();
+        });
+        Some(Screen::Deriving { rx, generated: !self.have_secret_key })
+    }
+
+    fn confirm_screen(&mut self, ui: &mut Ui) -> Option<Screen> {
+        let Screen::Confirm { keys, generated, written_down } = &mut self.screen else {
+            return None;
+        };
+        let mut next = None;
+        ui.add_space(8.0);
+        ui.heading(if *generated { "Save your secret key" } else { "Check your fingerprint" });
+        ui.add_space(8.0);
+
+        theme::card().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(theme::small("Key fingerprint"));
+            ui.label(RichText::new(fingerprint(&keys.master)).monospace().size(28.0).color(theme::ACCENT));
+            ui.label(theme::small(if *generated {
+                "Every device set up with the same master password and secret key shows this."
+            } else {
+                "This must match the fingerprint on your other device. If it doesn't, go back and retype the master password."
+            }));
+        });
+        if *generated {
+            theme::card().show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(theme::small("Secret key"));
+                ui.add(egui::Label::new(RichText::new(encode_secret_key(&keys.secret)).monospace()).wrap());
+                ui.label(theme::small(
+                    "Write this down and keep it somewhere safe. A new device needs it together with \
+                     your master password. It can't be recovered if you lose it.",
+                ));
+            });
+            theme::checkbox(ui, written_down, "I have written down my secret key");
+        }
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            if ui.button("Back").clicked() {
+                next = Some(Screen::Setup);
+            }
+            let ready = !*generated || *written_down;
+            if ui.add_enabled(ready, theme::primary_button("", "Save and continue")).clicked() {
+                match store::save_keys(store::ACCOUNT, keys) {
+                    Ok(()) => {
+                        self.keys = Some(Keys { ..*keys });
+                        self.error.clear();
+                        self.focus_search = true;
+                        next = Some(Screen::Sites);
+                    }
+                    Err(e) => self.error = format!("Can't save to the system keyring: {e}"),
+                }
+            }
+        });
+        next
+    }
+
+    // ---- Sites -------------------------------------------------------------------------------
+
+    fn copy(&mut self, text: String) {
+        if self.clipboard.is_none() {
+            self.clipboard = Clipboard::new().ok();
+        }
+        let result = match &mut self.clipboard {
+            Some(clipboard) => store::copy_secret(clipboard, &text).map_err(|e| e.to_string()),
+            None => Err("no clipboard available".to_string()),
+        };
+        match result {
+            Ok(()) => {
+                self.copied_at = Some(Instant::now());
+                self.error.clear();
+                store::clear_clipboard_later(text);
+            }
+            Err(e) => self.error = format!("Can't copy: {e}"),
+        }
+    }
+
+    fn select(&mut self, index: Option<usize>) {
+        self.selected = index;
+        self.show_password = false;
+        self.copied_at = None;
+    }
+
+    fn sites_screen(&mut self, ui: &mut Ui) -> Option<Screen> {
+        let mut next = None;
+        ui.horizontal(|ui| {
+            ui.add(self.mark(ui, 28.0));
+            ui.heading("Echo");
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if theme::icon_button(ui, icon::GEAR, "Settings").clicked() {
+                    next = Some(Screen::Settings(Settings::default()));
+                }
+            });
+        });
+        ui.add_space(4.0);
+
+        if self.sites.sites.is_empty() {
+            ui.add_space(ui.available_height() * 0.22);
+            ui.vertical_centered(|ui| {
+                ui.add(self.mark(ui, 72.0).tint(theme::BORDER));
+                ui.add_space(8.0);
+                ui.label(RichText::new("No sites yet").size(18.0).strong());
+                ui.label(theme::muted("Echo works out a password for every site you add."));
+                ui.add_space(12.0);
+                if ui.add(theme::primary_button(icon::PLUS, "Add a site")).clicked() {
+                    next = Some(Screen::Editor(Editor::blank()));
+                }
+            });
+            return next;
+        }
+
+        ui.horizontal(|ui| {
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui.add(theme::primary_button(icon::PLUS, "Add site")).clicked() {
+                    next = Some(Screen::Editor(Editor::blank()));
+                }
+                let search = ui.add(
+                    theme::text_field(&mut self.search)
+                        .hint_text(theme::icon_text(icon::MAGNIFYING_GLASS, "Search sites", theme::MUTED, 15.0)),
+                );
+                if std::mem::take(&mut self.focus_search) {
+                    search.request_focus();
+                }
+            });
+        });
+        ui.add_space(4.0);
+
+        // The selected site's card is pinned to the bottom; the list takes whatever is left.
+        if let Some(index) = self.selected.filter(|&i| i < self.sites.sites.len()) {
+            egui::Panel::bottom("detail")
+                .frame(egui::Frame::NONE)
+                .show_separator_line(false)
+                .show(ui, |ui| {
+                    ui.add_space(8.0);
+                    if let Some(screen) = self.detail_card(ui, index) {
+                        next = Some(screen);
+                    }
+                });
+        }
+
+        let query = normalize(&self.search);
+        egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| {
+            egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+                let mut clicked = None;
+                let mut shown = 0;
+                for (i, site) in self.sites.sites.iter().enumerate() {
+                    if !site.site.contains(&query) && !site.login.contains(&query) {
+                        continue;
+                    }
+                    shown += 1;
+                    if site_row(ui, site, self.selected == Some(i)).clicked() {
+                        clicked = Some(i);
+                    }
+                }
+                if shown == 0 {
+                    ui.add_space(24.0);
+                    ui.vertical_centered(|ui| ui.label(theme::muted("No sites match your search.")));
+                }
+                if clicked.is_some() {
+                    self.select(clicked);
+                }
+            });
+        });
+        next
+    }
+
+    fn detail_card(&mut self, ui: &mut Ui, index: usize) -> Option<Screen> {
+        let site = self.sites.sites[index].clone();
+        let keys = self.keys.as_ref()?;
+        let generated = password(
+            &site_key(&keys.master, &site.site, &site.login, site.counter),
+            site.length,
+            &site.classes,
+        );
+        let mut next = None;
+        theme::card().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    ui.label(RichText::new(&site.site).strong().size(16.0));
+                    if !site.login.is_empty() {
+                        ui.label(theme::small(&site.login));
+                    }
+                });
+                ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
+                    if theme::icon_button(ui, icon::PENCIL_SIMPLE, "Edit site").clicked() {
+                        next = Some(Screen::Editor(Editor::new(Some(index), &site)));
+                    }
+                });
+            });
+            let mut pw = match generated {
+                Ok(pw) => pw,
+                Err(e) => {
+                    ui.colored_label(theme::DANGER, format!("This site's settings are invalid: {e}"));
+                    return;
+                }
+            };
+
+            egui::Frame::new()
+                .fill(theme::BG)
+                .corner_radius(theme::RADIUS)
+                .inner_margin(egui::Margin::symmetric(12, 6))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            let (glyph, label) = if self.show_password {
+                                (icon::EYE_SLASH, "Hide password")
+                            } else {
+                                (icon::EYE, "Show password")
+                            };
+                            if theme::icon_button(ui, glyph, label).clicked() {
+                                self.show_password = !self.show_password;
+                            }
+                            ui.with_layout(Layout::left_to_right(Align::Center).with_main_wrap(true), |ui| {
+                                let shown = if self.show_password { pw.clone() } else { "•".repeat(pw.len()) };
+                                ui.add(egui::Label::new(RichText::new(shown).monospace().size(16.0)).wrap());
+                            });
+                        });
+                    });
+                });
+
+            let just_copied = self.copied_at.is_some_and(|at| at.elapsed() < COPIED_FLASH);
+            let (glyph, label) = if just_copied { (icon::CHECK, "Copied") } else { (icon::COPY, "Copy password") };
+            if ui.add_sized([ui.available_width(), 40.0], theme::primary_button(glyph, label)).clicked() {
+                self.copy(pw.clone());
+            }
+            if just_copied {
+                ui.ctx().request_repaint_after(COPIED_FLASH);
+            }
+            pw.zeroize();
+
+            ui.label(theme::small(if self.copied_at.is_some() {
+                format!("The clipboard is cleared after {} seconds.", store::CLIPBOARD_CLEAR_AFTER.as_secs())
+            } else {
+                format!(
+                    "{} characters  ·  counter {}  ·  about {:.0} bits",
+                    site.length,
+                    site.counter,
+                    entropy_bits(site.length, &site.classes)
+                )
+            }));
+        });
+        next
+    }
+
+    // ---- Editor ------------------------------------------------------------------------------
+
+    fn editor_screen(&mut self, ui: &mut Ui) -> Option<Screen> {
+        let Screen::Editor(editor) = &mut self.screen else {
+            return None;
+        };
+        let mut next = None;
+        let back = header(ui, if editor.index.is_some() { "Edit site" } else { "Add site" });
+
+        theme::card().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            let site = theme::field(ui, "Site", |ui| {
+                ui.add(theme::text_field(&mut editor.site).hint_text("github.com"))
+            });
+            if std::mem::take(&mut editor.focus_site) {
+                site.request_focus();
+            }
+            theme::field(ui, "Login (optional)", |ui| {
+                ui.add(theme::text_field(&mut editor.login).hint_text("username or email"))
+            });
+        });
+
+        theme::card().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(theme::small("Length"));
+            ui.add(egui::Slider::new(&mut editor.length, 4..=64).suffix(" characters"));
+            ui.add_space(4.0);
+
+            ui.label(theme::small("Characters"));
+            ui.horizontal(|ui| {
+                for (on, label) in [
+                    (&mut editor.lower, "a–z"),
+                    (&mut editor.upper, "A–Z"),
+                    (&mut editor.digits, "0–9"),
+                    (&mut editor.symbols, "!@#"),
+                ] {
+                    ui.toggle_value(on, label);
+                }
+            });
+            ui.add_space(4.0);
+
+            ui.label(theme::small("Counter"));
+            ui.horizontal(|ui| {
+                if ui.add_enabled(editor.counter > 1, theme::button(icon::MINUS, "")).clicked() {
+                    editor.counter -= 1;
+                }
+                ui.add_sized(
+                    [48.0, 36.0],
+                    egui::DragValue::new(&mut editor.counter).range(1..=u32::MAX),
+                );
+                if ui.add(theme::button(icon::PLUS, "")).clicked() {
+                    editor.counter = editor.counter.saturating_add(1);
+                }
+            });
+            ui.label(theme::small("Raise it to get a new password for this site."));
+            ui.add_space(4.0);
+            ui.label(theme::small(format!(
+                "Strength: about {:.0} bits",
+                entropy_bits(editor.length, &editor.classes())
+            )));
+        });
+
+        if editor.index.is_some() {
+            theme::note(ui, icon::WARNING, "Changing anything here changes this site's password.", theme::MUTED);
+        }
+        ui.add_space(4.0);
+
+        // Work on a copy so a failed save leaves the list in memory matching the file.
+        let mut updated = self.sites.clone();
+        let mut selected = None;
+        let mut saved = false;
+        ui.horizontal(|ui| {
+            if ui.add(theme::primary_button("", "Save")).clicked() {
+                let result = editor.to_site().and_then(|site| {
+                    let duplicate = updated.sites.iter().enumerate().any(|(i, other)| {
+                        Some(i) != editor.index && other.site == site.site && other.login == site.login
+                    });
+                    if duplicate {
+                        return Err("That site and login already exist.".to_string());
+                    }
+                    let key = (site.site.clone(), site.login.clone());
+                    match editor.index {
+                        Some(i) => updated.sites[i] = site,
+                        None => updated.sites.push(site),
+                    }
+                    updated.sites.sort_by(|a, b| (&a.site, &a.login).cmp(&(&b.site, &b.login)));
+                    updated.save(&self.sites_path)?;
+                    Ok(updated.sites.iter().position(|s| (&s.site, &s.login) == (&key.0, &key.1)))
+                });
+                match result {
+                    Ok(position) => {
+                        selected = position;
+                        saved = true;
+                    }
+                    Err(e) => self.error = e,
+                }
+            }
+            if ui.button("Cancel").clicked() {
+                next = Some(Screen::Sites);
+            }
+            if let Some(i) = editor.index {
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if !editor.confirm_delete {
+                        if ui.add(theme::danger_button(icon::TRASH, "Delete")).clicked() {
+                            editor.confirm_delete = true;
+                        }
+                    } else if ui.add(theme::danger_button("", "Yes, delete it")).clicked() {
+                        updated.sites.remove(i);
+                        match updated.save(&self.sites_path) {
+                            Ok(()) => saved = true,
+                            Err(e) => self.error = e,
+                        }
+                    }
+                });
+            }
+        });
+        if editor.confirm_delete {
+            ui.label(theme::small(
+                "Echo forgets this site's settings. Adding it again with the same settings gives the same password.",
+            ));
+        }
+
+        if saved {
+            self.sites = updated;
+            self.select(selected);
+            next = Some(Screen::Sites);
+        }
+        if back || ui.input(|i| i.key_pressed(Key::Escape)) {
+            next = Some(Screen::Sites);
+        }
+        if next.is_some() {
+            self.error.clear();
+            self.focus_search = true;
+        }
+        next
+    }
+
+    // ---- Settings ----------------------------------------------------------------------------
+
+    fn export_sites(&self, path: &Path) -> Result<String, String> {
+        self.sites.save(path)?;
+        Ok(format!("Exported {} sites to {}.", self.sites.sites.len(), path.display()))
+    }
+
+    fn import_sites(&mut self, path: &Path) -> Result<String, String> {
+        let imported = SiteList::load(path)?;
+        let mut updated = self.sites.clone();
+        let (added, replaced) = updated.merge(imported);
+        updated.save(&self.sites_path)?;
+        self.sites = updated;
+        self.select(None);
+        Ok(format!("Imported: {added} new, {replaced} updated."))
+    }
+
+    fn settings_screen(&mut self, ui: &mut Ui) -> Option<Screen> {
+        let mut next = None;
+        let back = header(ui, "Settings");
+
+        // A file dialog finished on its thread?
+        let finished = match &mut self.screen {
+            Screen::Settings(settings) => match &settings.dialog {
+                Some((kind, rx)) => match rx.try_recv() {
+                    Ok(path) => {
+                        let kind = *kind;
+                        settings.dialog = None;
+                        path.map(|path| (kind, path))
+                    }
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        settings.dialog = None;
+                        None
+                    }
+                    Err(mpsc::TryRecvError::Empty) => None,
+                },
+                None => None,
+            },
+            _ => return None,
+        };
+        if let Some((kind, path)) = finished {
+            let result = match kind {
+                Dialog::Export => self.export_sites(&path),
+                Dialog::Import => self.import_sites(&path),
+            };
+            let (message, error) = match result {
+                Ok(message) => (message, String::new()),
+                Err(e) => (String::new(), e),
+            };
+            self.error = error;
+            if let Screen::Settings(settings) = &mut self.screen {
+                settings.message = message;
+            }
+        }
+
+        let Screen::Settings(settings) = &mut self.screen else {
+            return None;
+        };
+        let Some(keys) = &self.keys else {
+            return Some(Screen::Setup);
+        };
+
+        theme::card().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(RichText::new("Your key").strong());
+            ui.horizontal(|ui| {
+                ui.label(theme::muted("Fingerprint"));
+                ui.label(RichText::new(fingerprint(&keys.master)).monospace().color(theme::ACCENT));
+            });
+            if settings.reveal {
+                ui.add(egui::Label::new(RichText::new(encode_secret_key(&keys.secret)).monospace()).wrap());
+            }
+            let label = if settings.reveal { "Hide secret key" } else { "Show secret key" };
+            if ui.button(label).clicked() {
+                settings.reveal = !settings.reveal;
+            }
+            ui.label(theme::small("A new device needs the secret key together with your master password."));
+        });
+
+        theme::card().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(RichText::new("Site list").strong());
+            ui.label(theme::small(
+                "Site names and settings, never passwords. Use the file to back up or to move your sites to another device.",
+            ));
+            ui.horizontal(|ui| {
+                let idle = settings.dialog.is_none();
+                for (kind, glyph, label) in [
+                    (Dialog::Export, icon::UPLOAD_SIMPLE, "Export…"),
+                    (Dialog::Import, icon::DOWNLOAD_SIMPLE, "Import…"),
+                ] {
+                    if ui.add_enabled(idle, theme::button(glyph, label)).clicked() {
+                        settings.dialog = Some((kind, open_dialog(kind, ui.ctx().clone())));
+                    }
+                }
+            });
+            if !settings.message.is_empty() {
+                theme::note(ui, icon::CHECK_CIRCLE, &settings.message, theme::ACCENT);
+            }
+        });
+
+        theme::card().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(RichText::new("Reset").strong());
+            ui.label(theme::small(
+                "Removes your keys from this computer. Your site list stays. To use Echo again here \
+                 you need your master password and secret key.",
+            ));
+            ui.horizontal(|ui| {
+                if !settings.confirm_reset {
+                    if ui.add(theme::danger_button("", "Reset Echo")).clicked() {
+                        settings.confirm_reset = true;
+                    }
+                } else {
+                    if ui.add(theme::danger_button("", "Yes, remove my keys")).clicked() {
+                        match store::delete_keys(store::ACCOUNT) {
+                            Ok(()) => {
+                                self.keys = None;
+                                next = Some(Screen::Setup);
+                            }
+                            Err(e) => self.error = format!("Can't reach the system keyring: {e}"),
+                        }
+                    }
+                    if ui.button("Cancel").clicked() {
+                        settings.confirm_reset = false;
+                    }
+                }
+            });
+        });
+
+        ui.label(theme::small(format!(
+            "Echo {}  ·  {}",
+            env!("CARGO_PKG_VERSION"),
+            self.sites_path.display()
+        )));
+
+        if next.is_none() && (back || ui.input(|i| i.key_pressed(Key::Escape))) {
+            next = Some(self.go_to_sites());
+        }
+        next
+    }
+
+    // ---- Frame -------------------------------------------------------------------------------
+
+    fn draw(&mut self, ui: &mut Ui) {
+        let frame = egui::Frame::new().fill(theme::BG).inner_margin(egui::Margin::same(20));
+        egui::CentralPanel::default().frame(frame).show(ui, |ui| {
+            // Keep a readable measure on wide windows.
+            let mut rect = ui.available_rect_before_wrap();
+            if rect.width() > CONTENT_WIDTH {
+                rect = egui::Rect::from_center_size(rect.center(), egui::vec2(CONTENT_WIDTH, rect.height()));
+            }
+            ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| self.screen(ui));
+        });
+    }
+
+    fn screen(&mut self, ui: &mut Ui) {
+        // The sites screen fills the window, so its error is pinned to the bottom; every other
+        // screen shows the error right under the buttons that caused it.
+        let error_label = |ui: &mut Ui, error: &str| {
+            ui.add_space(8.0);
+            ui.add(egui::Label::new(theme::icon_text(icon::WARNING, error, theme::DANGER, 15.0)).wrap());
+        };
+        let pinned = matches!(self.screen, Screen::Sites);
+        if pinned && !self.error.is_empty() {
+            egui::Panel::bottom("error")
+                .frame(egui::Frame::NONE)
+                .show_separator_line(false)
+                .show(ui, |ui| error_label(ui, &self.error));
+        }
+        let next = match &self.screen {
+            Screen::Setup => self.setup_screen(ui),
+            Screen::Deriving { rx, generated } => {
+                let received = rx.try_recv().ok();
+                ui.add_space(ui.available_height() * 0.35);
+                ui.vertical_centered(|ui| {
+                    ui.spinner();
+                    ui.label(theme::muted("Deriving your key…"));
+                });
+                received.map(|keys| Screen::Confirm { keys, generated: *generated, written_down: false })
+            }
+            Screen::Confirm { .. } => self.confirm_screen(ui),
+            Screen::Sites => self.sites_screen(ui),
+            Screen::Editor(_) => self.editor_screen(ui),
+            Screen::Settings(_) => self.settings_screen(ui),
+            Screen::Fatal(message) => {
+                ui.add_space(24.0);
+                ui.heading("Echo can't start");
+                ui.label(theme::muted("The site list couldn't be read, so Echo stopped rather than overwrite it."));
+                ui.add(egui::Label::new(RichText::new(message).monospace()).wrap());
+                None
+            }
+        };
+        if !pinned && !self.error.is_empty() {
+            error_label(ui, &self.error);
+        }
+        if let Some(screen) = next {
+            self.screen = screen;
+        }
+    }
+}
+
+/// Back arrow and title. Returns true when back was clicked.
+fn header(ui: &mut Ui, title: &str) -> bool {
+    let back = ui
+        .horizontal(|ui| {
+            let back = theme::icon_button(ui, icon::ARROW_LEFT, "Back").clicked();
+            ui.heading(title);
+            back
+        })
+        .inner;
+    ui.add_space(4.0);
+    back
+}
+
+fn site_row(ui: &mut Ui, site: &Site, selected: bool) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 52.0), Sense::click());
+    let label = if site.login.is_empty() { site.site.clone() } else { format!("{}, {}", site.site, site.login) };
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, selected, &label)
+    });
+    if !ui.is_rect_visible(rect) {
+        return response;
+    }
+    let painter = ui.painter();
+    if selected || response.hovered() || response.has_focus() {
+        let fill = if selected { theme::SURFACE_HI } else { theme::SURFACE };
+        painter.rect_filled(rect, theme::RADIUS, fill);
+    }
+    if response.has_focus() {
+        painter.rect_stroke(rect, theme::RADIUS, egui::Stroke::new(1.5, theme::ACCENT), egui::StrokeKind::Inside);
+    }
+
+    let avatar = egui::pos2(rect.left() + 30.0, rect.center().y);
+    painter.circle_filled(avatar, 17.0, theme::ACCENT.gamma_multiply(0.16));
+    let initial = site.site.chars().next().unwrap_or('?').to_uppercase().to_string();
+    painter.text(avatar, egui::Align2::CENTER_CENTER, initial, egui::FontId::proportional(16.0), theme::ACCENT);
+
+    let left = rect.left() + 60.0;
+    if site.login.is_empty() {
+        painter.text(
+            egui::pos2(left, rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            &site.site,
+            egui::FontId::proportional(15.0),
+            theme::TEXT,
+        );
+    } else {
+        painter.text(
+            egui::pos2(left, rect.center().y - 9.0),
+            egui::Align2::LEFT_CENTER,
+            &site.site,
+            egui::FontId::proportional(15.0),
+            theme::TEXT,
+        );
+        painter.text(
+            egui::pos2(left, rect.center().y + 10.0),
+            egui::Align2::LEFT_CENTER,
+            &site.login,
+            egui::FontId::proportional(13.0),
+            theme::MUTED,
+        );
+    }
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// Runs the system file dialog on its own thread so the window stays responsive.
+fn open_dialog(kind: Dialog, ctx: egui::Context) -> Receiver<Option<PathBuf>> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let dialog = rfd::FileDialog::new().add_filter("Echo site list", &["json"]);
+        let path = match kind {
+            Dialog::Export => dialog.set_file_name("echo-sites.json").save_file(),
+            Dialog::Import => dialog.pick_file(),
+        };
+        let _ = tx.send(path);
+        ctx.request_repaint();
+    });
+    rx
+}
+
+impl eframe::App for App {
+    fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
+        self.draw(ui);
+    }
+}
+
+fn main() -> eframe::Result {
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([460.0, 680.0])
+            .with_min_inner_size([380.0, 520.0])
+            .with_app_id("echo"),
+        ..Default::default()
+    };
+    eframe::run_native(
+        "Echo",
+        options,
+        Box::new(|cc| {
+            theme::apply(&cc.egui_ctx);
+            Ok(Box::new(App::new()))
+        }),
+    )
+}
+
+#[cfg(test)]
+mod tests;

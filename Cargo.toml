@@ -1,0 +1,8 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+default-members = ["crates/echo-desktop"]
+
+# Argon2id at 64 MiB is painfully slow unoptimised.
+[profile.dev.package.argon2]
+opt-level = 3

@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Echo
+Comment=Deterministic password generator
+Exec=echo-desktop
+Icon=echo
+Categories=Utility;Security;
+Keywords=password;generator;
+StartupWMClass=echo

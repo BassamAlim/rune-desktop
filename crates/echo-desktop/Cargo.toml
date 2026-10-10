@@ -1,0 +1,17 @@
+[package]
+name = "echo-desktop"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+arboard = { version = "3.6.1", default-features = false, features = ["wayland-data-control"] }
+echo-core = { version = "0.1.0", path = "../echo-core" }
+eframe = "0.36.2"
+egui-phosphor = "0.14.0"
+keyring = "4.2.0"
+rfd = "0.17.2"
+zeroize = "1.9.1"
+
+[dev-dependencies]
+egui_kittest = { version = "0.36", features = ["wgpu", "snapshot"] }
+image = { version = "0.25.10", default-features = false, features = ["png"] }
