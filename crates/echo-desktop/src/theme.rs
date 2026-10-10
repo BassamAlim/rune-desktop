@@ -1,4 +1,4 @@
-//! Echo's look: one dark palette, shared with the Android app's dark theme.
+//! Echo's look: one warm dark palette and one amber accent, shared with the Android app.
 
 use eframe::egui::text::{LayoutJob, TextFormat};
 use eframe::egui::{
@@ -7,14 +7,14 @@ use eframe::egui::{
 };
 pub use egui_phosphor::regular as icon;
 
-pub const BG: Color32 = Color32::from_rgb(0x0F, 0x17, 0x2A);
-pub const SURFACE: Color32 = Color32::from_rgb(0x19, 0x21, 0x34);
-pub const SURFACE_HI: Color32 = Color32::from_rgb(0x23, 0x2D, 0x45);
-pub const BORDER: Color32 = Color32::from_rgb(0x2B, 0x36, 0x54);
-pub const TEXT: Color32 = Color32::from_rgb(0xF1, 0xF5, 0xF9);
-pub const MUTED: Color32 = Color32::from_rgb(0x94, 0xA3, 0xB8);
-pub const ACCENT: Color32 = Color32::from_rgb(0x34, 0xD3, 0x99);
-pub const ON_ACCENT: Color32 = Color32::from_rgb(0x05, 0x2E, 0x22);
+pub const BG: Color32 = Color32::from_rgb(0x0D, 0x0B, 0x09);
+pub const SURFACE: Color32 = Color32::from_rgb(0x18, 0x15, 0x12);
+pub const SURFACE_HI: Color32 = Color32::from_rgb(0x23, 0x1F, 0x1A);
+pub const BORDER: Color32 = Color32::from_rgb(0x2C, 0x27, 0x22);
+pub const TEXT: Color32 = Color32::from_rgb(0xF6, 0xF1, 0xE9);
+pub const MUTED: Color32 = Color32::from_rgb(0xA8, 0x9F, 0x92);
+pub const ACCENT: Color32 = Color32::from_rgb(0xFF, 0xB0, 0x20);
+pub const ON_ACCENT: Color32 = Color32::from_rgb(0x1A, 0x12, 0x00);
 pub const DANGER: Color32 = Color32::from_rgb(0xF8, 0x71, 0x71);
 
 pub const RADIUS: u8 = 10;
@@ -23,18 +23,25 @@ pub const GAP: f32 = 8.0;
 pub const PAD: i8 = 16;
 
 pub fn apply(ctx: &egui::Context) {
-    // Inter for the interface, JetBrains Mono for passwords and keys (0/O and l/1 stay distinct).
+    // Space Grotesk for the interface, JetBrains Mono for passwords and keys (0/O and l/1 stay
+    // distinct). Both are variable fonts, so the weight is chosen here: Space Grotesk's own
+    // default is Light, which is too thin on a dark ground.
     let mut fonts = egui::FontDefinitions::default();
-    for (name, bytes, family) in [
-        ("inter", &include_bytes!("../../../assets/fonts/inter.ttf")[..], egui::FontFamily::Proportional),
-        ("jetbrains_mono", &include_bytes!("../../../assets/fonts/jetbrains_mono.ttf")[..], egui::FontFamily::Monospace),
+    for (name, bytes, family, weight) in [
+        ("space_grotesk", &include_bytes!("../../../assets/fonts/space_grotesk.ttf")[..], egui::FontFamily::Proportional, 450.0),
+        ("jetbrains_mono", &include_bytes!("../../../assets/fonts/jetbrains_mono.ttf")[..], egui::FontFamily::Monospace, 450.0),
     ] {
-        fonts.font_data.insert(name.to_owned(), egui::FontData::from_static(bytes).into());
+        let tweak = egui::FontTweak {
+            coords: egui::epaint::text::VariationCoords::new([(b"wght", weight)]),
+            ..Default::default()
+        };
+        fonts.font_data.insert(name.to_owned(), egui::FontData::from_static(bytes).tweak(tweak).into());
         fonts.families.entry(family).or_default().insert(0, name.to_owned());
     }
     egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
     // Icons are drawn from their own family (see `glyph`), never through the text fallback chain:
-    // Inter has private-use glyphs of its own, and the icon font has ligatures for plain letters.
+    // a text font may have private-use glyphs of its own, and the icon font has ligatures for
+    // plain letters.
     for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
         fonts.families.entry(family).or_default().retain(|name| name != "phosphor");
     }

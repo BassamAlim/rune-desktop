@@ -161,9 +161,13 @@ Kotlin, Jetpack Compose (Material 3), Hilt, Navigation Compose, DataStore, `andr
 
 ## 5a. Design
 
-One dark theme shared by both apps: navy surfaces (`#0F172A`, `#192134`, `#232D45`), one green
-accent (`#34D399`), Inter for the interface and JetBrains Mono for passwords and keys. The mark
-is a lowercase "e" with two fading echoes; sources are `assets/logo.svg` and `assets/mark.svg`.
+One dark theme shared by both apps: warm near-black surfaces (`#0D0B09`, `#181512`, `#231F1A`),
+one amber accent (`#FFB020`), Space Grotesk for the interface and JetBrains Mono for passwords
+and keys.
+
+The mark is a keyhole with two evenly spaced outlines rippling out from it; small sizes use one
+outline. Its geometry lives in `scripts/mark/gen.py`, and `scripts/mark/assets.py` writes every
+asset from it: the desktop SVGs and the Android vector drawables.
 
 ## 6. Tests
 

@@ -125,6 +125,7 @@ struct App {
     screen: Screen,
     error: String,
     mark: Option<egui::TextureHandle>,
+    mark_small: Option<egui::TextureHandle>,
 
     // Setup form
     password: String,
@@ -156,6 +157,7 @@ impl App {
             screen: Screen::Setup,
             error: String::new(),
             mark: None,
+            mark_small: None,
             password: String::new(),
             confirm: String::new(),
             have_secret_key: false,
@@ -188,14 +190,21 @@ impl App {
         app
     }
 
+    /// The mark at `size` points: two echoes when there is room for them, one when there isn't.
     fn mark(&mut self, ui: &Ui, size: f32) -> egui::Image<'static> {
-        let texture = self.mark.get_or_insert_with(|| {
-            let image = egui::ColorImage::from_rgba_unmultiplied(
-                [96, 96],
-                include_bytes!("../../../assets/mark-96.rgba"),
-            );
-            ui.ctx().load_texture("mark", image, egui::TextureOptions::LINEAR)
-        });
+        let load = |name: &str, side: usize, bytes: &[u8]| {
+            let image = egui::ColorImage::from_rgba_unmultiplied([side, side], bytes);
+            ui.ctx().load_texture(name, image, egui::TextureOptions::LINEAR)
+        };
+        let texture = if size >= 48.0 {
+            self.mark.get_or_insert_with(|| {
+                load("mark", 192, include_bytes!("../../../assets/mark-192.rgba"))
+            })
+        } else {
+            self.mark_small.get_or_insert_with(|| {
+                load("mark-small", 96, include_bytes!("../../../assets/mark-small-96.rgba"))
+            })
+        };
         egui::Image::new((texture.id(), egui::Vec2::splat(size)))
     }
 
@@ -356,8 +365,8 @@ impl App {
     fn sites_screen(&mut self, ui: &mut Ui) -> Option<Screen> {
         let mut next = None;
         ui.horizontal(|ui| {
-            ui.add(self.mark(ui, 28.0));
-            ui.heading("Echo");
+            ui.add(self.mark(ui, 30.0));
+            ui.heading("echo");
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if theme::icon_button(ui, icon::GEAR, "Settings").clicked() {
                     next = Some(Screen::Settings(Settings::default()));
@@ -886,7 +895,8 @@ fn site_row(ui: &mut Ui, site: &Site, selected: bool) -> egui::Response {
     }
 
     let avatar = egui::pos2(rect.left() + 30.0, rect.center().y);
-    painter.circle_filled(avatar, 17.0, theme::ACCENT.gamma_multiply(0.16));
+    let tile = egui::Rect::from_center_size(avatar, egui::Vec2::splat(36.0));
+    painter.rect_filled(tile, 11, theme::ACCENT.gamma_multiply(0.16));
     let initial = site.site.chars().next().unwrap_or('?').to_uppercase().to_string();
     painter.text(avatar, egui::Align2::CENTER_CENTER, initial, egui::FontId::proportional(16.0), theme::ACCENT);
 

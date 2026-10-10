@@ -11,7 +11,8 @@ different password for every site; no password is ever stored. The Android app i
 ```
 crates/echo-core/      the echo/v1 algorithm and the site list (no UI, no keyring)
 crates/echo-desktop/   the egui app: main.rs (screens), theme.rs (look), store.rs (keyring, clipboard)
-assets/                logo, in-app mark, fonts (Inter, JetBrains Mono), launcher entry
+assets/                logo, in-app mark, fonts, launcher entry
+scripts/mark/          the mark's geometry and the generator for every logo asset, Android included
 scripts/install.sh     build a release binary and install it for the current user
 ```
 
