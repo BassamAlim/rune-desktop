@@ -1,10 +1,35 @@
-# Echo (desktop)
+<p align="center">
+  <img src="assets/logo.svg" width="96" alt="Echo logo" />
+</p>
 
-A deterministic password generator for Linux. One master password and a secret key become a
-different password for every site; no password is ever stored. The Android app is in
-`echo-android` and produces the same passwords.
+<h1 align="center">Echo</h1>
 
-`SPEC.md` is the contract for both apps. `vectors.json` is the shared test data.
+<p align="center">
+  <b>A deterministic password generator for Linux.</b><br />
+  One master password and a secret key become a different password for every site. No password is ever stored.
+</p>
+
+![Setup, the site list with a password, the site editor and settings](docs/images/screens.png)
+
+<sub>Rendered from the app's own screens by its screenshot test.</sub>
+
+The Android app is in [`echo-android`](https://github.com/BassamAlim/echo-android) and produces
+the same passwords. `SPEC.md` is the contract for both apps; `vectors.json` is the shared test
+data.
+
+## Features
+
+- **Nothing to steal.** Passwords are worked out from your master password, a secret key held
+  on the device, and the site's name. They are never written to disk.
+- **Sites.** A searchable list of site names and logins. Two logins on one site get two
+  different passwords.
+- **Per-site settings.** Length, which kinds of character, and a counter you raise to get a
+  new password for that site.
+- **Careful copy.** A copied password is kept out of clipboard history and cleared after 30
+  seconds if it is still on the clipboard.
+- **Same passwords on your phone.** Set both apps up with the same master password and secret
+  key; the four-character fingerprint shows they match.
+- **Export and import.** The site list is one JSON file, shared with the Android app.
 
 ## Layout
 
@@ -34,7 +59,8 @@ cargo test -p echo-desktop -- --ignored clipboard     # overwrites the clipboard
 
 ## Where things are kept
 
-- Keys: the Secret Service keyring (KWallet), service `echo`, account `keys`.
+- Keys: the Secret Service keyring (KWallet), service `echo`, account `keys`. Anyone at your
+  unlocked desktop session can open Echo; the keyring is the lock.
 - Site list: `~/.local/share/echo/sites.json`. It holds names and settings, never passwords.
 
 ## Changing the algorithm
