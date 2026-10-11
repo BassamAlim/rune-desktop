@@ -37,12 +37,22 @@ fn hmac(key: &[u8], parts: &[&[u8]]) -> Key {
     mac.finalize().into_bytes().into()
 }
 
+/// §2.1 — NFKC, then runs of ASCII whitespace become one space and the ends are trimmed, so a
+/// stray or doubled space can't silently change every password. Case is kept.
+fn normalize_master(master_password: &str) -> String {
+    nfkc(master_password)
+        .split(|c| matches!(c, '\t'..='\r' | ' '))
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// §2.1 — slow (64 MiB, ~1 s). Run once at setup.
 pub fn master_key(master_password: &str) -> Key {
     let params = Params::new(65536, 3, 4, Some(32)).expect("fixed params are valid");
     let mut out = [0u8; 32];
     Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
-        .hash_password_into(nfkc(master_password).as_bytes(), b"rune/v1/master", &mut out)
+        .hash_password_into(normalize_master(master_password).as_bytes(), b"rune/v1/master", &mut out)
         .expect("fixed params are valid");
     out
 }

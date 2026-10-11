@@ -17,6 +17,7 @@ fn main() {
         ("correct horse battery staple", "pin.example", "", 1, 6, "d", d),
         ("correct horse battery staple", "long.example", "", 1, 64, "lud", d),
         ("pässwörd ﬁ", "github.com", "bassam", 1, 20, "luds", d), // NFKC on the master password
+        (" correct\u{a0}horse\t battery  staple\n", "github.com", "bassam", 1, 20, "luds", d), // whitespace: same as case 0
         ("correct horse battery staple", "strict.example", "", 1, 16, "luds", "._-"), // canonical order is "-_."
         ("correct horse battery staple", "strict.example", "", 1, 16, "luds", "-_."), // same password as above
     ];

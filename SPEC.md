@@ -33,7 +33,9 @@ fingerprint ("practice"). It can be skipped for that unlock; the next one asks a
 
 ## 2. Algorithm (`rune/v1`)
 
-All strings are UTF-8 after NFKC normalisation. `u32be(x)` is a 4-byte big-endian integer.
+All strings are UTF-8 after NFKC normalisation. The master password is then also cleaned:
+split on runs of ASCII whitespace (U+0009–000D and U+0020), empty pieces dropped, joined with
+single spaces. Case is kept. `u32be(x)` is a 4-byte big-endian integer.
 
 ### 2.1 Master key (once, at setup)
 
