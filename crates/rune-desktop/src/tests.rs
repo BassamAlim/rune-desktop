@@ -189,6 +189,19 @@ fn setup_checks_the_typed_back_words() {
 }
 
 #[test]
+fn own_master_password_is_hidden_until_shown() {
+    let mut app = App::start(temp_dir("reveal").join("sites.json"), Ok(None));
+    app.generated = None;
+    let mut harness = harness(app, Harness::builder());
+    // Masked fields are password inputs to assistive tech; revealed ones are plain text inputs.
+    assert_eq!(harness.query_all_by_role(Role::PasswordInput).count(), 2);
+
+    harness.query_all_by_label("Show password").next().unwrap().click();
+    harness.run();
+    assert_eq!(harness.query_all_by_role(Role::PasswordInput).count(), 0, "one switch reveals both");
+}
+
+#[test]
 fn strength_ranks_common_passwords_weak_and_passphrases_strong() {
     assert_eq!(strength("Bassam2024!").1, theme::DANGER);
     assert_eq!(strength("password123").1, theme::DANGER);

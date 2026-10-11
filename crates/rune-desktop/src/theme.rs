@@ -173,6 +173,22 @@ pub fn field(ui: &mut Ui, label: &str, add: impl FnOnce(&mut Ui) -> Response) ->
     response
 }
 
+/// A masked field with an eye button that reveals it. `shown` is shared by fields that should
+/// reveal together, like a password and its repeat.
+pub fn password_field(ui: &mut Ui, text: &mut String, shown: &mut bool) -> Response {
+    ui.horizontal(|ui| {
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let (glyph, label) = if *shown { (icon::EYE_SLASH, "Hide password") } else { (icon::EYE, "Show password") };
+            if icon_button(ui, glyph, label).clicked() {
+                *shown = !*shown;
+            }
+            ui.add(text_field(text).password(!*shown))
+        })
+        .inner
+    })
+    .inner
+}
+
 pub fn text_field(text: &mut String) -> egui::TextEdit<'_> {
     egui::TextEdit::singleline(text).desired_width(f32::INFINITY).margin(Margin::symmetric(12, 9))
 }

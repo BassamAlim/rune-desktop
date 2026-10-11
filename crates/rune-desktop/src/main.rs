@@ -137,6 +137,7 @@ struct App {
     generated: Option<String>,
     password: String,
     confirm: String,
+    show_master: bool,
 
     // Set once setup is done
     keys: Option<Keys>,
@@ -165,6 +166,7 @@ impl App {
             generated: Some(new_passphrase()),
             password: String::new(),
             confirm: String::new(),
+            show_master: false,
             keys: None,
             sites: SiteList { version: 1, sites: vec![] },
             sites_path,
@@ -260,10 +262,10 @@ impl App {
             )));
         } else {
             theme::field(ui, "Master password", |ui| {
-                ui.add(theme::text_field(&mut self.password).password(true))
+                theme::password_field(ui, &mut self.password, &mut self.show_master)
             });
             theme::field(ui, "Repeat master password", |ui| {
-                ui.add(theme::text_field(&mut self.confirm).password(true))
+                theme::password_field(ui, &mut self.confirm, &mut self.show_master)
             });
             if !self.password.is_empty() {
                 let (text, color) = strength(&self.password);
