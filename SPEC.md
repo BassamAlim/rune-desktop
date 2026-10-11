@@ -21,7 +21,8 @@ The secret key is what makes a leaked site password useless for guessing the mas
 A new device needs both the master password and the secret key.
 
 Secret key as text: RFC 4648 Base32, no padding (52 characters), shown in groups of 4.
-Input ignores case, spaces and dashes. There is no QR code in v1: the key is typed once per device.
+Input ignores case, spaces and dashes. The desktop also shows the key as a QR code (the same text);
+the phone's setup screen scans it on-device, so the key never has to be typed on the phone.
 
 ## 2. Algorithm (`echo/v1`)
 
@@ -153,7 +154,7 @@ with type-safe routes, one `StateFlow<UiState>` per ViewModel.
 
 ### 4.5 Hardening
 
-- No `INTERNET` permission. `FLAG_SECURE` on both activities. `allowBackup="false"` and everything excluded from device transfer.
+- No `INTERNET` permission. `CAMERA` only for scanning the secret key at setup, decoded on the phone by zxing. `FLAG_SECURE` on both activities. `allowBackup="false"` and everything excluded from device transfer.
 
 ### 4.6 Stack
 
@@ -188,7 +189,6 @@ vector drawables.
 ## 7. Not in v1
 
 - Sync of any kind, multiple profiles, storing passwords Rune didn't generate.
-- QR code for moving the secret key between devices.
 - Inline (keyboard) autofill suggestions; the dropdown is used.
 - A light theme.
 - Credential Manager provider (Android 14+) — add when apps you use need it.

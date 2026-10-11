@@ -309,9 +309,10 @@ impl App {
                 ui.set_width(ui.available_width());
                 ui.label(theme::small("Secret key"));
                 ui.add(egui::Label::new(RichText::new(encode_secret_key(&keys.secret)).monospace()).wrap());
+                secret_key_qr(ui, &keys.secret);
                 ui.label(theme::small(
                     "Write this down and keep it somewhere safe. A new device needs it together with \
-                     your master password. It can't be recovered if you lose it.",
+                     your master password; a phone can scan the code instead. It can't be recovered if you lose it.",
                 ));
             });
             theme::checkbox(ui, written_down, "I have written down my secret key");
@@ -758,6 +759,8 @@ impl App {
             });
             if settings.reveal {
                 ui.add(egui::Label::new(RichText::new(encode_secret_key(&keys.secret)).monospace()).wrap());
+                secret_key_qr(ui, &keys.secret);
+                ui.label(theme::small("Setting up your phone? Scan this from its setup screen."));
             }
             let label = if settings.reveal { "Hide secret key" } else { "Show secret key" };
             if ui.button(label).clicked() {
@@ -894,6 +897,26 @@ impl App {
         }).inner;
         if let Some(screen) = next {
             self.screen = screen;
+        }
+    }
+}
+
+/// The secret key as a QR code, for the phone to scan at setup. Dark on light with the standard
+/// quiet zone, whatever the theme: that is what scanners read reliably.
+fn secret_key_qr(ui: &mut Ui, key: &rune_core::Key) {
+    let code = qrcode::QrCode::new(encode_secret_key(key)).expect("52 characters always fit");
+    let modules = code.width() + 8;
+    let side = 200.0;
+    let (rect, _) = ui.allocate_exact_size(egui::Vec2::splat(side), Sense::hover());
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, theme::RADIUS, egui::Color32::WHITE);
+    let cell = side / modules as f32;
+    for (i, color) in code.to_colors().into_iter().enumerate() {
+        if color == qrcode::Color::Dark {
+            let (x, y) = ((i % code.width() + 4) as f32, (i / code.width() + 4) as f32);
+            let min = rect.min + egui::vec2(x * cell, y * cell);
+            // A hair of overlap so no seams show between neighbouring modules.
+            painter.rect_filled(egui::Rect::from_min_size(min, egui::Vec2::splat(cell + 0.5)), 0, egui::Color32::BLACK);
         }
     }
 }
