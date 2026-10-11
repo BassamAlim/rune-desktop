@@ -12,11 +12,8 @@ apps: copy `vectors.json` to `rune-android/app/src/test/resources/` in the same 
 ## Rules that matter
 
 - **`rune-core` is frozen by `vectors.json`.** Any output change changes every password the
-  user has. The vectors test passes unchanged; a real algorithm change means `echo/v2`, new
+  user has. The vectors test passes unchanged; a real algorithm change means `rune/v2`, new
   vectors from `cargo run -p rune-core --example gen-vectors`, and the same change in Android.
-- **The `echo/v1` and `echo/v1/check` strings keep the old name.** The app was called Echo;
-  those bytes are hashed into every password and the fingerprint. Every other "echo" in the
-  code is a missed rename.
 - **Secrets are zeroized after use.** The master password, confirmation and derived passwords
   are wiped with `zeroize` once consumed; a new field holding a secret gets the same treatment.
 - **An unreadable site list stops the app** (`Screen::Fatal`) rather than starting empty:

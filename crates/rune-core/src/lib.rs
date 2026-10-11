@@ -1,4 +1,4 @@
-//! Rune `echo/v1` algorithm. See SPEC.md §2 — this file must match it byte for byte.
+//! The `rune/v1` algorithm. See SPEC.md §2 — this file must match it byte for byte.
 
 use argon2::{Algorithm, Argon2, Params, Version};
 use hmac::{Hmac, KeyInit, Mac};
@@ -51,7 +51,7 @@ pub fn site_key(master_key: &Key, site: &str, login: &str, counter: u32) -> Key 
     hmac(
         master_key,
         &[
-            b"echo/v1",
+            b"rune/v1",
             &(site.len() as u32).to_be_bytes(),
             site.as_bytes(),
             &(login.len() as u32).to_be_bytes(),
@@ -120,7 +120,7 @@ pub fn entropy_bits(length: usize, classes: &str, symbols: &str) -> f64 {
 
 /// §2.4
 pub fn fingerprint(master_key: &Key) -> String {
-    let h = hmac(master_key, &[b"echo/v1/check"]);
+    let h = hmac(master_key, &[b"rune/v1/check"]);
     format!("{:02x}{:02x}", h[0], h[1])
 }
 

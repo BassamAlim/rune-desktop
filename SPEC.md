@@ -24,10 +24,7 @@ Secret key as text: RFC 4648 Base32, no padding (52 characters), shown in groups
 Input ignores case, spaces and dashes. The desktop also shows the key as a QR code (the same text);
 the phone's setup screen scans it on-device, so the key never has to be typed on the phone.
 
-## 2. Algorithm (`echo/v1`)
-
-The app was first called Echo. The tag keeps that name on purpose: it is hashed into every
-password, so renaming it would change them all.
+## 2. Algorithm (`rune/v1`)
 
 All strings are UTF-8 after NFKC normalisation. `u32be(x)` is a 4-byte big-endian integer.
 
@@ -41,7 +38,7 @@ masterKey = Argon2id(
     length   = 32)
 ```
 
-Parameters are fixed by the `echo/v1` tag. Changing them means `echo/v2`.
+Parameters are fixed by the `rune/v1` tag. Changing them means `rune/v2`.
 
 ### 2.2 Site key
 
@@ -50,7 +47,7 @@ site  = lowercase(trim(siteName))
 login = lowercase(trim(loginName))      # may be empty
 
 siteKey = HMAC-SHA256(masterKey,
-    "echo/v1" ‖ u32be(len(site)) ‖ site ‖ u32be(len(login)) ‖ login ‖ u32be(counter))
+    "rune/v1" ‖ u32be(len(site)) ‖ site ‖ u32be(len(login)) ‖ login ‖ u32be(counter))
 ```
 
 `counter` starts at 1. Bump it to rotate one password.
@@ -89,7 +86,7 @@ Default policy: 75-character alphabet × 20 ≈ 124 bits.
 ### 2.4 Key fingerprint
 
 ```
-fingerprint = first 2 bytes of HMAC-SHA256(masterKey, "echo/v1/check"), shown as 4 hex digits
+fingerprint = first 2 bytes of HMAC-SHA256(masterKey, "rune/v1/check"), shown as 4 hex digits
 ```
 
 Stored on the device and shown at setup. Used to reject a mistyped master password on

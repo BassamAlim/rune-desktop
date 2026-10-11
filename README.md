@@ -34,7 +34,7 @@ data.
 ## Layout
 
 ```
-crates/rune-core/      the echo/v1 algorithm and the site list (no UI, no keyring)
+crates/rune-core/      the rune/v1 algorithm and the site list (no UI, no keyring)
 crates/rune-desktop/   the egui app: main.rs (screens), theme.rs (look), store.rs (keyring, clipboard)
 assets/                logo, in-app mark, fonts, launcher entry
 scripts/mark/          the mark and the generator for every logo asset, Android included
@@ -65,7 +65,7 @@ cargo test -p rune-desktop -- --ignored clipboard     # overwrites the clipboard
 
 ## Changing the algorithm
 
-Don't, without bumping `echo/v1` to `echo/v2` in the derivation: every existing password would
+Don't, without bumping `rune/v1` to `rune/v2` in the derivation: every existing password would
 change. If you do, regenerate the vectors and copy them to the Android repo:
 
 ```bash
