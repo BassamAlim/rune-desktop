@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use arboard::Clipboard;
 use rune_core::{
-    DEFAULT_SYMBOLS, Site, SiteList, canonical_symbols, entropy_bits, fingerprint, master_key, passphrase, passphrase_bits,
+    DEFAULT_LENGTH, DEFAULT_SYMBOLS, Site, SiteList, canonical_symbols, entropy_bits, fingerprint, master_key, passphrase, passphrase_bits,
     normalize, password, site_key,
 };
 use eframe::egui::{self, Align, Key, Layout, RichText, Sense, Ui};
@@ -62,7 +62,7 @@ impl Editor {
                 site: String::new(),
                 login: String::new(),
                 counter: 1,
-                length: 20,
+                length: DEFAULT_LENGTH,
                 classes: "luds".to_string(),
                 symbols: DEFAULT_SYMBOLS.to_string(),
                 apps: vec![],

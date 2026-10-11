@@ -9,6 +9,9 @@ use unicode_normalization::UnicodeNormalization;
 
 pub type Key = [u8; 32];
 
+/// §2.3 — the length a new site starts with.
+pub const DEFAULT_LENGTH: usize = 16;
+
 const LOWER: &str = "abcdefghijklmnopqrstuvwxyz";
 const UPPER: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
 const DIGITS: &str = "0123456789";

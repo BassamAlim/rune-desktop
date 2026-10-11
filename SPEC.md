@@ -61,7 +61,7 @@ siteKey = HMAC-SHA256(masterKey,
 
 ### 2.3 Password
 
-Policy per site: `length` (4–64, default 20), enabled character classes (default all four), and
+Policy per site: `length` (4–64, default 16), enabled character classes (default all four), and
 the symbols the site allows (default `!@#$%^&*-_=+?`).
 
 ```
@@ -88,7 +88,9 @@ loop:
 Rejection sampling keeps the output uniform over all valid passwords. Because the default symbols
 lead `allSymbols` in their original order, a site with the default set gets the same alphabet,
 and the same passwords, as before per-site symbols existed.
-Default policy: 75-character alphabet × 20 ≈ 124 bits.
+Default policy: 75-character alphabet × 16 ≈ 100 bits, beyond any guessing even offline, and
+within the 16-character cap some sites (often banks) impose. Each site stores its own length, so
+the default only applies to sites added after it changes.
 
 ### 2.4 Key fingerprint
 
@@ -108,7 +110,7 @@ Not secret, but required: a lost counter or policy means a lost password.
   "version": 1,
   "sites": [
     { "site": "github.com", "login": "bassam", "counter": 1,
-      "length": 20, "classes": "luds", "symbols": "!@#$%^&*-_=+?",
+      "length": 16, "classes": "luds", "symbols": "!@#$%^&*-_=+?",
       "apps": ["com.github.android"] }
   ]
 }

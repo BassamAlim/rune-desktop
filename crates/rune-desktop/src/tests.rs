@@ -40,7 +40,7 @@ fn site(name: &str, login: &str) -> Site {
         site: name.into(),
         login: login.into(),
         counter: 1,
-        length: 20,
+        length: DEFAULT_LENGTH,
         classes: "luds".into(),
         symbols: DEFAULT_SYMBOLS.into(),
         apps: vec![],
@@ -79,7 +79,7 @@ fn add_show_and_delete_a_site() {
     assert_eq!(SiteList::load(&path).unwrap().sites, vec![expected]);
     assert_eq!(harness.state().selected, Some(0));
 
-    let pw = password(&site_key(&MASTER, "github.com", "bassam", 1), 20, "luds", DEFAULT_SYMBOLS).unwrap();
+    let pw = password(&site_key(&MASTER, "github.com", "bassam", 1), DEFAULT_LENGTH, "luds", DEFAULT_SYMBOLS).unwrap();
     assert!(harness.query_by_label(&pw).is_none(), "password must be hidden until shown");
     click(&mut harness, "Show password");
     harness.get_by_label(&pw);
