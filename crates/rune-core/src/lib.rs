@@ -1,4 +1,4 @@
-//! Echo `echo/v1` algorithm. See SPEC.md §2 — this file must match it byte for byte.
+//! Rune `echo/v1` algorithm. See SPEC.md §2 — this file must match it byte for byte.
 
 use argon2::{Algorithm, Argon2, Params, Version};
 use hmac::{Hmac, KeyInit, Mac};
@@ -237,7 +237,7 @@ mod tests {
 
     #[test]
     fn save_then_load() {
-        let dir = std::env::temp_dir().join(format!("echo-core-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("rune-core-test-{}", std::process::id()));
         let path = dir.join("nested/sites.json");
         assert_eq!(SiteList::load(&path).unwrap().sites, vec![]);
         let list = SiteList {

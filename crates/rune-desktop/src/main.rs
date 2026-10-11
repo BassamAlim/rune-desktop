@@ -6,7 +6,7 @@ use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
 use arboard::Clipboard;
-use echo_core::{
+use rune_core::{
     Site, SiteList, decode_secret_key, encode_secret_key, entropy_bits, fingerprint, master_key,
     normalize, password, site_key,
 };
@@ -125,7 +125,6 @@ struct App {
     screen: Screen,
     error: String,
     mark: Option<egui::TextureHandle>,
-    mark_small: Option<egui::TextureHandle>,
 
     // Setup form
     password: String,
@@ -157,7 +156,6 @@ impl App {
             screen: Screen::Setup,
             error: String::new(),
             mark: None,
-            mark_small: None,
             password: String::new(),
             confirm: String::new(),
             have_secret_key: false,
@@ -190,21 +188,15 @@ impl App {
         app
     }
 
-    /// The mark at `size` points: two echoes when there is room for them, one when there isn't.
+    /// The mark at `size` points. Mipmapped, so one raster stays smooth down to app-bar size.
     fn mark(&mut self, ui: &Ui, size: f32) -> egui::Image<'static> {
-        let load = |name: &str, side: usize, bytes: &[u8]| {
-            let image = egui::ColorImage::from_rgba_unmultiplied([side, side], bytes);
-            ui.ctx().load_texture(name, image, egui::TextureOptions::LINEAR)
-        };
-        let texture = if size >= 48.0 {
-            self.mark.get_or_insert_with(|| {
-                load("mark", 192, include_bytes!("../../../assets/mark-192.rgba"))
-            })
-        } else {
-            self.mark_small.get_or_insert_with(|| {
-                load("mark-small", 96, include_bytes!("../../../assets/mark-small-96.rgba"))
-            })
-        };
+        let texture = self.mark.get_or_insert_with(|| {
+            let bytes = include_bytes!("../../../assets/mark-192.rgba");
+            let image = egui::ColorImage::from_rgba_unmultiplied([192, 192], bytes);
+            let options = egui::TextureOptions::LINEAR
+                .with_mipmap_mode(Some(egui::TextureFilter::Linear));
+            ui.ctx().load_texture("mark", image, options)
+        });
         egui::Image::new((texture.id(), egui::Vec2::splat(size)))
     }
 
@@ -221,7 +213,7 @@ impl App {
         ui.vertical_centered(|ui| {
             ui.add(self.mark(ui, 64.0));
             ui.add_space(4.0);
-            ui.heading("Set up Echo");
+            ui.heading("Set up Rune");
             ui.label(theme::muted(
                 "One master password becomes a different password for every site. Nothing is stored.",
             ));
@@ -366,7 +358,7 @@ impl App {
         let mut next = None;
         ui.horizontal(|ui| {
             ui.add(self.mark(ui, 30.0));
-            ui.heading("echo");
+            ui.heading("rune");
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if theme::icon_button(ui, icon::GEAR, "Settings").clicked() {
                     next = Some(Screen::Settings(Settings::default()));
@@ -381,7 +373,7 @@ impl App {
                 ui.add(self.mark(ui, 72.0).tint(theme::BORDER));
                 ui.add_space(8.0);
                 ui.label(RichText::new("No sites yet").size(18.0).strong());
-                ui.label(theme::muted("Echo works out a password for every site you add."));
+                ui.label(theme::muted("Rune works out a password for every site you add."));
                 ui.add_space(12.0);
                 if ui.add(theme::primary_button(icon::PLUS, "Add a site")).clicked() {
                     next = Some(Screen::Editor(Editor::blank()));
@@ -642,7 +634,7 @@ impl App {
         });
         if editor.confirm_delete {
             ui.label(theme::small(
-                "Echo forgets this site's settings. Adding it again with the same settings gives the same password.",
+                "Rune forgets this site's settings. Adding it again with the same settings gives the same password.",
             ));
         }
 
@@ -766,12 +758,12 @@ impl App {
             ui.set_width(ui.available_width());
             ui.label(RichText::new("Reset").strong());
             ui.label(theme::small(
-                "Removes your keys from this computer. Your site list stays. To use Echo again here \
+                "Removes your keys from this computer. Your site list stays. To use Rune again here \
                  you need your master password and secret key.",
             ));
             ui.horizontal(|ui| {
                 if !settings.confirm_reset {
-                    if ui.add(theme::danger_button("", "Reset Echo")).clicked() {
+                    if ui.add(theme::danger_button("", "Reset Rune")).clicked() {
                         settings.confirm_reset = true;
                     }
                 } else {
@@ -792,7 +784,7 @@ impl App {
         });
 
         ui.label(theme::small(format!(
-            "Echo {}  ·  {}",
+            "Rune {}  ·  {}",
             env!("CARGO_PKG_VERSION"),
             self.sites_path.display()
         )));
@@ -848,8 +840,8 @@ impl App {
             Screen::Settings(_) => self.settings_screen(ui),
             Screen::Fatal(message) => {
                 ui.add_space(24.0);
-                ui.heading("Echo can't start");
-                ui.label(theme::muted("The site list couldn't be read, so Echo stopped rather than overwrite it."));
+                ui.heading("Rune can't start");
+                ui.label(theme::muted("The site list couldn't be read, so Rune stopped rather than overwrite it."));
                 ui.add(egui::Label::new(RichText::new(message).monospace()).wrap());
                 None
             }
@@ -932,9 +924,9 @@ fn site_row(ui: &mut Ui, site: &Site, selected: bool) -> egui::Response {
 fn open_dialog(kind: Dialog, ctx: egui::Context) -> Receiver<Option<PathBuf>> {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
-        let dialog = rfd::FileDialog::new().add_filter("Echo site list", &["json"]);
+        let dialog = rfd::FileDialog::new().add_filter("Rune site list", &["json"]);
         let path = match kind {
-            Dialog::Export => dialog.set_file_name("echo-sites.json").save_file(),
+            Dialog::Export => dialog.set_file_name("rune-sites.json").save_file(),
             Dialog::Import => dialog.pick_file(),
         };
         let _ = tx.send(path);
@@ -954,11 +946,11 @@ fn main() -> eframe::Result {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([460.0, 680.0])
             .with_min_inner_size([380.0, 520.0])
-            .with_app_id("echo"),
+            .with_app_id("rune"),
         ..Default::default()
     };
     eframe::run_native(
-        "Echo",
+        "Rune",
         options,
         Box::new(|cc| {
             theme::apply(&cc.egui_ctx);

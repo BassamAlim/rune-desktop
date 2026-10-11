@@ -1,9 +1,9 @@
 [Desktop Entry]
 Type=Application
-Name=Echo
+Name=Rune
 Comment=Deterministic password generator
-Exec=echo-desktop
-Icon=echo
+Exec=rune-desktop
+Icon=rune
 Categories=Utility;Security;
 Keywords=password;generator;
-StartupWMClass=echo
+StartupWMClass=rune

@@ -994,35 +994,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d8b14ccef22fc6f5a8f4d7d768562a182c04ce9a3b3157b91390b52ddfdf1a76"
 
 [[package]]
-name = "echo-core"
-version = "0.1.0"
-dependencies = [
- "argon2",
- "data-encoding",
- "hex",
- "hmac",
- "serde",
- "serde_json",
- "sha2",
- "unicode-normalization",
-]
-
-[[package]]
-name = "echo-desktop"
-version = "0.1.0"
-dependencies = [
- "arboard",
- "echo-core",
- "eframe",
- "egui-phosphor",
- "egui_kittest",
- "image",
- "keyring",
- "rfd",
- "zeroize",
-]
-
-[[package]]
 name = "ecolor"
 version = "0.36.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3182,6 +3153,35 @@ dependencies = [
  "wayland-protocols",
  "web-sys",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "rune-core"
+version = "0.1.0"
+dependencies = [
+ "argon2",
+ "data-encoding",
+ "hex",
+ "hmac",
+ "serde",
+ "serde_json",
+ "sha2",
+ "unicode-normalization",
+]
+
+[[package]]
+name = "rune-desktop"
+version = "0.1.0"
+dependencies = [
+ "arboard",
+ "eframe",
+ "egui-phosphor",
+ "egui_kittest",
+ "image",
+ "keyring",
+ "rfd",
+ "rune-core",
+ "zeroize",
 ]
 
 [[package]]

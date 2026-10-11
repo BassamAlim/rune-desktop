@@ -1,11 +1,11 @@
-# Echo — spec v1
+# Rune — spec v1
 
 Deterministic password generator. Same inputs, same password; no passwords are ever stored.
 
 Two private GitHub repos, personal use only:
 
-- `echo-android` — Kotlin/Compose app, sideloaded APK, minSdk 30 (Android 11)
-- `echo-desktop` — Rust app for Linux
+- `rune-android` — Kotlin/Compose app, sideloaded APK, minSdk 30 (Android 11)
+- `rune-desktop` — Rust app for Linux
 
 Both implement the algorithm below independently and must pass the same `vectors.json`.
 
@@ -24,6 +24,9 @@ Secret key as text: RFC 4648 Base32, no padding (52 characters), shown in groups
 Input ignores case, spaces and dashes. There is no QR code in v1: the key is typed once per device.
 
 ## 2. Algorithm (`echo/v1`)
+
+The app was first called Echo. The tag keeps that name on purpose: it is hashed into every
+password, so renaming it would change them all.
 
 All strings are UTF-8 after NFKC normalisation. `u32be(x)` is a 4-byte big-endian integer.
 
@@ -134,7 +137,7 @@ with type-safe routes, one `StateFlow<UiState>` per ViewModel.
 - `AutofillService`. The service never holds a password: every suggestion is a locked dataset that opens `AutofillActivity`, which authenticates, derives the password and returns the filled dataset.
 - Web: only a known browser (a fixed package list) is believed about which domain it is showing. A page matches a saved site when the domain equals the site or ends with `.` + site, and the site name contains a dot.
 - Apps: match the package name against a site's `apps`. The link is made when the user picks a site for that app and authenticates.
-- A "choose in Echo" suggestion is always offered. In a browser it also offers to add the page's domain as a new site with default settings.
+- A "choose in Rune" suggestion is always offered. In a browser it also offers to add the page's domain as a new site with default settings.
 - Nothing is saved from forms.
 
 ### 4.4 Clipboard
@@ -152,12 +155,12 @@ Kotlin, Jetpack Compose (Material 3), Hilt, Navigation Compose, DataStore, `andr
 
 ## 5. Desktop (Rust)
 
-- One Cargo workspace: `echo-core` (library: algorithm + site list, no I/O beyond the JSON file) and `echo-desktop` (GUI binary).
+- One Cargo workspace: `rune-core` (library: algorithm + site list, no I/O beyond the JSON file) and `rune-desktop` (GUI binary).
 - GUI: `eframe`/`egui`, native Wayland. Screens: setup, sites (list with the selected site's password in a card below), site editor, settings.
-- Master key and secret key stored in the Secret Service keyring (KWallet on KDE) via the `keyring` crate; secret key entered once as Base32 text from the phone. Anyone at the unlocked desktop session can open Echo — the keyring is the lock.
+- Master key and secret key stored in the Secret Service keyring (KWallet on KDE) via the `keyring` crate; secret key entered once as Base32 text from the phone. Anyone at the unlocked desktop session can open Rune — the keyring is the lock.
 - Copy flags the password so clipboard managers (Klipper) keep it out of history, and clears it after 30 s if it is still what is on the clipboard.
-- Site list at `$XDG_DATA_HOME/echo/sites.json`. Export and import through the system file dialog.
-- This repo owns `SPEC.md` and `vectors.json`; `cargo run -p echo-core --example gen-vectors` regenerates the vectors. `echo-android` holds a copy of `vectors.json` only.
+- Site list at `$XDG_DATA_HOME/rune/sites.json`. Export and import through the system file dialog.
+- This repo owns `SPEC.md` and `vectors.json`; `cargo run -p rune-core --example gen-vectors` regenerates the vectors. `rune-android` holds a copy of `vectors.json` only.
 
 ## 5a. Design
 
@@ -165,9 +168,9 @@ One dark theme shared by both apps: warm near-black surfaces (`#0D0B09`, `#18151
 one amber accent (`#FFB020`), Space Grotesk for the interface and JetBrains Mono for passwords
 and keys.
 
-The mark is a keyhole with two evenly spaced outlines rippling out from it; small sizes use one
-outline. Its geometry lives in `scripts/mark/gen.py`, and `scripts/mark/assets.py` writes every
-asset from it: the desktop SVGs and the Android vector drawables.
+The mark is ᚱ (Raido), the Elder Futhark R, drawn as round-capped strokes. `scripts/mark/assets.py`
+holds its geometry and writes every asset from it: the desktop SVGs and raster, and the Android
+vector drawables.
 
 ## 6. Tests
 
@@ -177,7 +180,7 @@ asset from it: the desktop SVGs and the Android vector drawables.
 
 ## 7. Not in v1
 
-- Sync of any kind, multiple profiles, storing passwords Echo didn't generate.
+- Sync of any kind, multiple profiles, storing passwords Rune didn't generate.
 - QR code for moving the secret key between devices.
 - Inline (keyboard) autofill suggestions; the dropdown is used.
 - A light theme.

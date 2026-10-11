@@ -5,10 +5,10 @@ use egui_kittest::{Harness, kittest::Queryable};
 
 use super::*;
 
-const MASTER: echo_core::Key = [7; 32];
+const MASTER: rune_core::Key = [7; 32];
 
 fn temp_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("echo-desktop-{name}-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("rune-desktop-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     dir
 }
@@ -120,7 +120,7 @@ fn export_then_import_merges() {
     let dir = temp_dir("transfer");
     let mut app = app_with_keys(dir.join("sites.json"));
     app.sites.sites = vec![site("a.example", ""), site("b.example", "")];
-    let file = dir.join("out/echo-sites.json");
+    let file = dir.join("out/rune-sites.json");
     app.export_sites(&file).unwrap();
 
     let mut other = app_with_keys(dir.join("other/sites.json"));
@@ -160,7 +160,7 @@ fn editor_normalises_and_validates() {
 }
 
 /// Renders every screen to target/screenshots/ for a visual check:
-/// `cargo test -p echo-desktop -- --ignored screenshots`
+/// `cargo test -p rune-desktop -- --ignored screenshots`
 #[test]
 #[ignore = "needs a GPU adapter; writes PNGs"]
 fn screenshots() {

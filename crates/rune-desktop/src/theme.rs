@@ -1,4 +1,4 @@
-//! Echo's look: one warm dark palette and one amber accent, shared with the Android app.
+//! Rune's look: one warm dark palette and one amber accent, shared with the Android app.
 
 use eframe::egui::text::{LayoutJob, TextFormat};
 use eframe::egui::{

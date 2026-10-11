@@ -1,11 +1,11 @@
 [package]
-name = "echo-desktop"
+name = "rune-desktop"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
 arboard = { version = "3.6.1", default-features = false, features = ["wayland-data-control"] }
-echo-core = { version = "0.1.0", path = "../echo-core" }
+rune-core = { version = "0.1.0", path = "../rune-core" }
 eframe = "0.36.2"
 egui-phosphor = "0.14.0"
 keyring = "4.2.0"

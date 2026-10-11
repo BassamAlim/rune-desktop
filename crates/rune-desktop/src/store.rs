@@ -5,10 +5,10 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use arboard::{Clipboard, SetExtLinux};
-use echo_core::Key;
+use rune_core::Key;
 use zeroize::Zeroize;
 
-const SERVICE: &str = "echo";
+const SERVICE: &str = "rune";
 pub const ACCOUNT: &str = "keys";
 pub const CLIPBOARD_CLEAR_AFTER: Duration = Duration::from_secs(30);
 
@@ -34,7 +34,7 @@ pub fn load_keys(account: &str) -> Result<Option<Keys>, String> {
                     secret: secret.try_into().unwrap(),
                     master: master.try_into().unwrap(),
                 })),
-                _ => Err("the stored Echo keys are corrupt".to_string()),
+                _ => Err("the stored Rune keys are corrupt".to_string()),
             };
             bytes.zeroize();
             keys
@@ -72,7 +72,7 @@ pub fn sites_path() -> PathBuf {
         .filter(|p| p.is_absolute())
         .or_else(|| std::env::home_dir().map(|home| home.join(".local/share")))
         .unwrap_or_default()
-        .join("echo/sites.json")
+        .join("rune/sites.json")
 }
 
 /// Puts a secret on the clipboard, flagged so clipboard managers (Klipper) keep it out of history.
@@ -115,8 +115,8 @@ mod tests {
     #[ignore = "overwrites the real clipboard"]
     fn clipboard_secret_is_flagged_and_readable() {
         let mut clipboard = Clipboard::new().unwrap();
-        copy_secret(&mut clipboard, "echo-clipboard-test").unwrap();
-        assert_eq!(clipboard.get_text().unwrap(), "echo-clipboard-test");
+        copy_secret(&mut clipboard, "rune-clipboard-test").unwrap();
+        assert_eq!(clipboard.get_text().unwrap(), "rune-clipboard-test");
         let types = std::process::Command::new("wl-paste").arg("--list-types").output().unwrap();
         let types = String::from_utf8_lossy(&types.stdout).into_owned();
         assert!(types.contains("x-kde-passwordManagerHint"), "offered types: {types}");

@@ -1,8 +1,8 @@
 <p align="center">
-  <img src="assets/logo.svg" width="96" alt="Echo logo" />
+  <img src="assets/logo.svg" width="96" alt="Rune logo" />
 </p>
 
-<h1 align="center">Echo</h1>
+<h1 align="center">Rune</h1>
 
 <p align="center">
   <b>A deterministic password generator for Linux.</b><br />
@@ -13,7 +13,7 @@
 
 <sub>Rendered from the app's own screens by its screenshot test.</sub>
 
-The Android app is in [`echo-android`](https://github.com/BassamAlim/echo-android) and produces
+The Android app is in [`rune-android`](https://github.com/BassamAlim/rune-android) and produces
 the same passwords. `SPEC.md` is the contract for both apps; `vectors.json` is the shared test
 data.
 
@@ -34,10 +34,10 @@ data.
 ## Layout
 
 ```
-crates/echo-core/      the echo/v1 algorithm and the site list (no UI, no keyring)
-crates/echo-desktop/   the egui app: main.rs (screens), theme.rs (look), store.rs (keyring, clipboard)
+crates/rune-core/      the echo/v1 algorithm and the site list (no UI, no keyring)
+crates/rune-desktop/   the egui app: main.rs (screens), theme.rs (look), store.rs (keyring, clipboard)
 assets/                logo, in-app mark, fonts, launcher entry
-scripts/mark/          the mark's geometry and the generator for every logo asset, Android included
+scripts/mark/          the mark and the generator for every logo asset, Android included
 scripts/install.sh     build a release binary and install it for the current user
 ```
 
@@ -52,16 +52,16 @@ scripts/install.sh              # install binary, launcher entry and icon into ~
 Three tests are ignored by default because they touch the real machine:
 
 ```bash
-cargo test -p echo-desktop -- --ignored screenshots   # render every screen to target/screenshots/
-cargo test -p echo-desktop -- --ignored keyring       # write and delete a test entry in the keyring
-cargo test -p echo-desktop -- --ignored clipboard     # overwrites the clipboard
+cargo test -p rune-desktop -- --ignored screenshots   # render every screen to target/screenshots/
+cargo test -p rune-desktop -- --ignored keyring       # write and delete a test entry in the keyring
+cargo test -p rune-desktop -- --ignored clipboard     # overwrites the clipboard
 ```
 
 ## Where things are kept
 
-- Keys: the Secret Service keyring (KWallet), service `echo`, account `keys`. Anyone at your
-  unlocked desktop session can open Echo; the keyring is the lock.
-- Site list: `~/.local/share/echo/sites.json`. It holds names and settings, never passwords.
+- Keys: the Secret Service keyring (KWallet), service `rune`, account `keys`. Anyone at your
+  unlocked desktop session can open Rune; the keyring is the lock.
+- Site list: `~/.local/share/rune/sites.json`. It holds names and settings, never passwords.
 
 ## Changing the algorithm
 
@@ -69,5 +69,5 @@ Don't, without bumping `echo/v1` to `echo/v2` in the derivation: every existing 
 change. If you do, regenerate the vectors and copy them to the Android repo:
 
 ```bash
-cargo run -p echo-core --example gen-vectors > vectors.json
+cargo run -p rune-core --example gen-vectors > vectors.json
 ```

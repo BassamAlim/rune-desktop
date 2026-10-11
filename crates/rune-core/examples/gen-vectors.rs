@@ -1,7 +1,7 @@
-//! Regenerates vectors.json: `cargo run -p echo-core --example gen-vectors > vectors.json`
-//! Only rerun when the algorithm version changes — these outputs are the contract with echo-android.
+//! Regenerates vectors.json: `cargo run -p rune-core --example gen-vectors > vectors.json`
+//! Only rerun when the algorithm version changes — these outputs are the contract with rune-android.
 
-use echo_core::*;
+use rune_core::*;
 use serde_json::json;
 
 fn main() {
