@@ -56,13 +56,16 @@ siteKey = HMAC-SHA256(masterKey,
 
 ### 2.3 Password
 
-Policy per site: `length` (4–64, default 20) and enabled character classes (default all four).
+Policy per site: `length` (4–64, default 20), enabled character classes (default all four), and
+the symbols the site allows (default `!@#$%^&*-_=+?`).
 
 ```
 lower   = abcdefghijklmnopqrstuvwxyz
 upper   = ABCDEFGHIJKLMNOPQRSTUVWXYZ
 digits  = 0123456789
-symbols = !@#$%^&*-_=+?
+allSymbols = !@#$%^&*-_=+?"'(),./:;<>[\]`{|}~     # the defaults, then the rest of ASCII punctuation
+symbols = the characters of allSymbols that the site allows, in allSymbols order
+          (any order, repeats ignored; anything else is an error; empty is an error when symbols are on)
 charset = enabled classes concatenated in the order above; n = len(charset)
 
 stream  = HMAC-SHA256(siteKey, u32be(0)) ‖ HMAC-SHA256(siteKey, u32be(1)) ‖ …
@@ -77,7 +80,9 @@ loop:
     otherwise discard it and continue with the same stream
 ```
 
-Rejection sampling keeps the output uniform over all valid passwords.
+Rejection sampling keeps the output uniform over all valid passwords. Because the default symbols
+lead `allSymbols` in their original order, a site with the default set gets the same alphabet,
+and the same passwords, as before per-site symbols existed.
 Default policy: 75-character alphabet × 20 ≈ 124 bits.
 
 ### 2.4 Key fingerprint
@@ -98,11 +103,13 @@ Not secret, but required: a lost counter or policy means a lost password.
   "version": 1,
   "sites": [
     { "site": "github.com", "login": "bassam", "counter": 1,
-      "length": 20, "classes": "luds", "apps": ["com.github.android"] }
+      "length": 20, "classes": "luds", "symbols": "!@#$%^&*-_=+?",
+      "apps": ["com.github.android"] }
   ]
 }
 ```
 
+- `symbols` is stored in canonical order and may be absent (files from before it existed): absent means the default.
 - One JSON file in app-private storage; the same format is the export/import file.
 - Export and import are manual, through the system file picker. Import merges by `(site, login)`; the higher counter wins.
 - The same file moves the list between phone and desktop.
@@ -128,8 +135,8 @@ with type-safe routes, one `StateFlow<UiState>` per ViewModel.
 
 1. **Setup** — master password twice, or join an existing key by typing the secret key; then the fingerprint and the secret key to write down; then the fingerprint sheet that seals the master key.
 2. **Sites** — searchable list of names and logins. Holds no secrets, so it has no lock.
-3. **Site** — opening it asks for the fingerprint; the password is shown masked with reveal and copy, and forgotten when the screen is left.
-4. **Editor** — site, login, counter, length, classes; delete behind a confirmation.
+3. **Site** — opening it asks for the fingerprint; the password is shown masked with reveal and copy, and forgotten when the screen is left. When the counter is above 1, the previous password (counter − 1) can be copied too, for a site's change-password form; it comes from the same unlock.
+4. **Editor** — site, login, counter, length, classes, allowed symbols; delete behind a confirmation.
 5. **Settings** — autofill, your key, fingerprint unlock, export/import, reset.
 
 ### 4.3 Autofill
@@ -156,7 +163,7 @@ Kotlin, Jetpack Compose (Material 3), Hilt, Navigation Compose, DataStore, `andr
 ## 5. Desktop (Rust)
 
 - One Cargo workspace: `rune-core` (library: algorithm + site list, no I/O beyond the JSON file) and `rune-desktop` (GUI binary).
-- GUI: `eframe`/`egui`, native Wayland. Screens: setup, sites (list with the selected site's password in a card below), site editor, settings.
+- GUI: `eframe`/`egui`, native Wayland. Screens: setup, sites (list with the selected site's password in a card below, and the previous password to copy when the counter is above 1), site editor, settings.
 - Master key and secret key stored in the Secret Service keyring (KWallet on KDE) via the `keyring` crate; secret key entered once as Base32 text from the phone. Anyone at the unlocked desktop session can open Rune — the keyring is the lock.
 - Copy flags the password so clipboard managers (Klipper) keep it out of history, and clears it after 30 s if it is still what is on the clipboard.
 - Site list at `$XDG_DATA_HOME/rune/sites.json`. Export and import through the system file dialog.

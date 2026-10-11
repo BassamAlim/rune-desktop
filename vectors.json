@@ -11,7 +11,8 @@
     "secretKey": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
     "secretKeyText": "AAAQ EAYE AUDA OCAJ BIFQ YDIO B4IB CEQT CQKR MFYY DENB WHA5 DYPQ",
     "site": "github.com",
-    "siteKey": "fac36a3e791a2f96c598c862da605c52939a31db2457b64811e9c71dfcef9628"
+    "siteKey": "fac36a3e791a2f96c598c862da605c52939a31db2457b64811e9c71dfcef9628",
+    "symbols": "!@#$%^&*-_=+?"
   },
   {
     "classes": "luds",
@@ -25,7 +26,8 @@
     "secretKey": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
     "secretKeyText": "AAAQ EAYE AUDA OCAJ BIFQ YDIO B4IB CEQT CQKR MFYY DENB WHA5 DYPQ",
     "site": "github.com",
-    "siteKey": "834ceddf1400360bacae6009012b91c1180a54d864d1c9786092c5ec291402d2"
+    "siteKey": "834ceddf1400360bacae6009012b91c1180a54d864d1c9786092c5ec291402d2",
+    "symbols": "!@#$%^&*-_=+?"
   },
   {
     "classes": "luds",
@@ -39,7 +41,8 @@
     "secretKey": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
     "secretKeyText": "AAAQ EAYE AUDA OCAJ BIFQ YDIO B4IB CEQT CQKR MFYY DENB WHA5 DYPQ",
     "site": "github.com",
-    "siteKey": "06371d3dc087e57a7b5b1bf8e869b9adfe98d867eb7b66ca3e6b01b568903f1b"
+    "siteKey": "06371d3dc087e57a7b5b1bf8e869b9adfe98d867eb7b66ca3e6b01b568903f1b",
+    "symbols": "!@#$%^&*-_=+?"
   },
   {
     "classes": "luds",
@@ -53,7 +56,8 @@
     "secretKey": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
     "secretKeyText": "AAAQ EAYE AUDA OCAJ BIFQ YDIO B4IB CEQT CQKR MFYY DENB WHA5 DYPQ",
     "site": "  GitHub.COM ",
-    "siteKey": "fac36a3e791a2f96c598c862da605c52939a31db2457b64811e9c71dfcef9628"
+    "siteKey": "fac36a3e791a2f96c598c862da605c52939a31db2457b64811e9c71dfcef9628",
+    "symbols": "!@#$%^&*-_=+?"
   },
   {
     "classes": "luds",
@@ -67,7 +71,8 @@
     "secretKey": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
     "secretKeyText": "AAAQ EAYE AUDA OCAJ BIFQ YDIO B4IB CEQT CQKR MFYY DENB WHA5 DYPQ",
     "site": "bücher.example",
-    "siteKey": "d72edd48da465ad0d09d1050b3cfbf9ac1e3d9585b6288631fee241ba9fec9d1"
+    "siteKey": "d72edd48da465ad0d09d1050b3cfbf9ac1e3d9585b6288631fee241ba9fec9d1",
+    "symbols": "!@#$%^&*-_=+?"
   },
   {
     "classes": "luds",
@@ -81,7 +86,8 @@
     "secretKey": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
     "secretKeyText": "AAAQ EAYE AUDA OCAJ BIFQ YDIO B4IB CEQT CQKR MFYY DENB WHA5 DYPQ",
     "site": "bank.example",
-    "siteKey": "6dac7c489c6b584400040a02e7094a6442b6448122b4211f7febf0e05b11a460"
+    "siteKey": "6dac7c489c6b584400040a02e7094a6442b6448122b4211f7febf0e05b11a460",
+    "symbols": "!@#$%^&*-_=+?"
   },
   {
     "classes": "d",
@@ -95,7 +101,8 @@
     "secretKey": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
     "secretKeyText": "AAAQ EAYE AUDA OCAJ BIFQ YDIO B4IB CEQT CQKR MFYY DENB WHA5 DYPQ",
     "site": "pin.example",
-    "siteKey": "b10c290f1323a40725fb914b99b842f3455e2103e77c13ad2eb16aaec7b29bc3"
+    "siteKey": "b10c290f1323a40725fb914b99b842f3455e2103e77c13ad2eb16aaec7b29bc3",
+    "symbols": "!@#$%^&*-_=+?"
   },
   {
     "classes": "lud",
@@ -109,7 +116,8 @@
     "secretKey": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
     "secretKeyText": "AAAQ EAYE AUDA OCAJ BIFQ YDIO B4IB CEQT CQKR MFYY DENB WHA5 DYPQ",
     "site": "long.example",
-    "siteKey": "7f769be5a597932fa456d2f5c7543974a37428f48ddba915d514a81fa3e8b6d6"
+    "siteKey": "7f769be5a597932fa456d2f5c7543974a37428f48ddba915d514a81fa3e8b6d6",
+    "symbols": "!@#$%^&*-_=+?"
   },
   {
     "classes": "luds",
@@ -123,6 +131,37 @@
     "secretKey": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
     "secretKeyText": "AAAQ EAYE AUDA OCAJ BIFQ YDIO B4IB CEQT CQKR MFYY DENB WHA5 DYPQ",
     "site": "github.com",
-    "siteKey": "ce08f698478883d9235e5c68b0695138e5d42a31b6cb59d9cab2f8b934e37625"
+    "siteKey": "ce08f698478883d9235e5c68b0695138e5d42a31b6cb59d9cab2f8b934e37625",
+    "symbols": "!@#$%^&*-_=+?"
+  },
+  {
+    "classes": "luds",
+    "counter": 1,
+    "fingerprint": "d245",
+    "length": 16,
+    "login": "",
+    "masterKey": "0b220637b2f1ea0425e3c3e4ea5c5c14fd91b0f26b5726839a04f2e387f75f73",
+    "masterPassword": "correct horse battery staple",
+    "password": "guDGyXe5mcaaRAd.",
+    "secretKey": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+    "secretKeyText": "AAAQ EAYE AUDA OCAJ BIFQ YDIO B4IB CEQT CQKR MFYY DENB WHA5 DYPQ",
+    "site": "strict.example",
+    "siteKey": "526f3da12018f0778cf4865e93d4488601733c491f73dba066b52fb467727ca1",
+    "symbols": "._-"
+  },
+  {
+    "classes": "luds",
+    "counter": 1,
+    "fingerprint": "d245",
+    "length": 16,
+    "login": "",
+    "masterKey": "0b220637b2f1ea0425e3c3e4ea5c5c14fd91b0f26b5726839a04f2e387f75f73",
+    "masterPassword": "correct horse battery staple",
+    "password": "guDGyXe5mcaaRAd.",
+    "secretKey": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+    "secretKeyText": "AAAQ EAYE AUDA OCAJ BIFQ YDIO B4IB CEQT CQKR MFYY DENB WHA5 DYPQ",
+    "site": "strict.example",
+    "siteKey": "526f3da12018f0778cf4865e93d4488601733c491f73dba066b52fb467727ca1",
+    "symbols": "-._"
   }
 ]

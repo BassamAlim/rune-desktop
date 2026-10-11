@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use arboard::Clipboard;
 use rune_core::{
-    Site, SiteList, decode_secret_key, encode_secret_key, entropy_bits, fingerprint, master_key,
+    DEFAULT_SYMBOLS, Site, SiteList, canonical_symbols, decode_secret_key, encode_secret_key, entropy_bits, fingerprint, master_key,
     normalize, password, site_key,
 };
 use eframe::egui::{self, Align, Key, Layout, RichText, Sense, Ui};
@@ -30,6 +30,7 @@ struct Editor {
     upper: bool,
     digits: bool,
     symbols: bool,
+    symbol_set: String,
     apps: Vec<String>,
     confirm_delete: bool,
     focus_site: bool,
@@ -47,6 +48,7 @@ impl Editor {
             upper: site.classes.contains('u'),
             digits: site.classes.contains('d'),
             symbols: site.classes.contains('s'),
+            symbol_set: site.symbols.clone(),
             apps: site.apps.clone(),
             confirm_delete: false,
             focus_site: index.is_none(),
@@ -62,6 +64,7 @@ impl Editor {
                 counter: 1,
                 length: 20,
                 classes: "luds".to_string(),
+                symbols: DEFAULT_SYMBOLS.to_string(),
                 apps: vec![],
             },
         )
@@ -83,12 +86,18 @@ impl Editor {
         if classes.is_empty() {
             return Err("Pick at least one kind of character.".to_string());
         }
+        let symbols = canonical_symbols(&self.symbol_set)
+            .map_err(|_| "Symbols can only be ASCII punctuation, like ! # - .".to_string())?;
+        if self.symbols && symbols.is_empty() {
+            return Err("Enter the symbols this site allows, or turn symbols off.".to_string());
+        }
         Ok(Site {
             site,
             login: normalize(&self.login),
             counter: self.counter,
             length: self.length,
             classes,
+            symbols,
             apps: self.apps.clone(),
         })
     }
@@ -444,7 +453,15 @@ impl App {
             &site_key(&keys.master, &site.site, &site.login, site.counter),
             site.length,
             &site.classes,
+            &site.symbols,
         );
+        // Changing a password on the site usually asks for the old one too.
+        let mut previous = (site.counter > 1)
+            .then(|| {
+                let key = site_key(&keys.master, &site.site, &site.login, site.counter - 1);
+                password(&key, site.length, &site.classes, &site.symbols).ok()
+            })
+            .flatten();
         let mut next = None;
         theme::card().show(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -502,6 +519,12 @@ impl App {
             }
             pw.zeroize();
 
+            if let Some(previous) = &previous
+                && ui.add(theme::button(icon::CLOCK_COUNTER_CLOCKWISE, "Copy previous password")).clicked()
+            {
+                self.copy(previous.clone());
+            }
+
             ui.label(theme::small(if self.copied_at.is_some() {
                 format!("The clipboard is cleared after {} seconds.", store::CLIPBOARD_CLEAR_AFTER.as_secs())
             } else {
@@ -509,10 +532,13 @@ impl App {
                     "{} characters  ·  counter {}  ·  about {:.0} bits",
                     site.length,
                     site.counter,
-                    entropy_bits(site.length, &site.classes)
+                    entropy_bits(site.length, &site.classes, &site.symbols)
                 )
             }));
         });
+        if let Some(previous) = &mut previous {
+            previous.zeroize();
+        }
         next
     }
 
@@ -555,6 +581,14 @@ impl App {
                     ui.toggle_value(on, label);
                 }
             });
+            if editor.symbols {
+                theme::field(ui, "Symbols this site allows", |ui| {
+                    ui.add(theme::text_field(&mut editor.symbol_set).font(egui::TextStyle::Monospace))
+                });
+                if ui.small_button("Reset to the usual symbols").clicked() {
+                    editor.symbol_set = DEFAULT_SYMBOLS.to_string();
+                }
+            }
             ui.add_space(4.0);
 
             ui.label(theme::small("Counter"));
@@ -574,7 +608,7 @@ impl App {
             ui.add_space(4.0);
             ui.label(theme::small(format!(
                 "Strength: about {:.0} bits",
-                entropy_bits(editor.length, &editor.classes())
+                entropy_bits(editor.length, &editor.classes(), &editor.symbol_set)
             )));
         });
 
@@ -816,39 +850,48 @@ impl App {
             ui.add_space(8.0);
             ui.add(egui::Label::new(theme::icon_text(icon::WARNING, error, theme::DANGER, 15.0)).wrap());
         };
-        let pinned = matches!(self.screen, Screen::Sites);
-        if pinned && !self.error.is_empty() {
-            egui::Panel::bottom("error")
-                .frame(egui::Frame::NONE)
-                .show_separator_line(false)
-                .show(ui, |ui| error_label(ui, &self.error));
-        }
-        let next = match &self.screen {
-            Screen::Setup => self.setup_screen(ui),
-            Screen::Deriving { rx, generated } => {
-                let received = rx.try_recv().ok();
-                ui.add_space(ui.available_height() * 0.35);
-                ui.vertical_centered(|ui| {
-                    ui.spinner();
-                    ui.label(theme::muted("Deriving your key…"));
-                });
-                received.map(|keys| Screen::Confirm { keys, generated: *generated, written_down: false })
+        if matches!(self.screen, Screen::Sites) {
+            if !self.error.is_empty() {
+                egui::Panel::bottom("error")
+                    .frame(egui::Frame::NONE)
+                    .show_separator_line(false)
+                    .show(ui, |ui| error_label(ui, &self.error));
             }
-            Screen::Confirm { .. } => self.confirm_screen(ui),
-            Screen::Sites => self.sites_screen(ui),
-            Screen::Editor(_) => self.editor_screen(ui),
-            Screen::Settings(_) => self.settings_screen(ui),
-            Screen::Fatal(message) => {
-                ui.add_space(24.0);
-                ui.heading("Rune can't start");
-                ui.label(theme::muted("The site list couldn't be read, so Rune stopped rather than overwrite it."));
-                ui.add(egui::Label::new(RichText::new(message).monospace()).wrap());
-                None
+            if let Some(screen) = self.sites_screen(ui) {
+                self.screen = screen;
             }
-        };
-        if !pinned && !self.error.is_empty() {
-            error_label(ui, &self.error);
+            return;
         }
+        // Every other screen scrolls, so nothing falls off the bottom of a short window.
+        let next = egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+            let next = match &self.screen {
+                Screen::Setup => self.setup_screen(ui),
+                Screen::Deriving { rx, generated } => {
+                    let received = rx.try_recv().ok();
+                    ui.add_space(ui.available_height() * 0.35);
+                    ui.vertical_centered(|ui| {
+                        ui.spinner();
+                        ui.label(theme::muted("Deriving your key…"));
+                    });
+                    received.map(|keys| Screen::Confirm { keys, generated: *generated, written_down: false })
+                }
+                Screen::Confirm { .. } => self.confirm_screen(ui),
+                Screen::Sites => unreachable!("drawn above"),
+                Screen::Editor(_) => self.editor_screen(ui),
+                Screen::Settings(_) => self.settings_screen(ui),
+                Screen::Fatal(message) => {
+                    ui.add_space(24.0);
+                    ui.heading("Rune can't start");
+                    ui.label(theme::muted("The site list couldn't be read, so Rune stopped rather than overwrite it."));
+                    ui.add(egui::Label::new(RichText::new(message).monospace()).wrap());
+                    None
+                }
+            };
+            if !self.error.is_empty() {
+                error_label(ui, &self.error);
+            }
+            next
+        }).inner;
         if let Some(screen) = next {
             self.screen = screen;
         }

@@ -12,7 +12,10 @@ pub type Key = [u8; 32];
 const LOWER: &str = "abcdefghijklmnopqrstuvwxyz";
 const UPPER: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
 const DIGITS: &str = "0123456789";
-const SYMBOLS: &str = "!@#$%^&*-_=+?";
+/// The default symbols, then the rest of ASCII punctuation: the fixed order a site's symbols
+/// take in the charset (§2.3). Keeping the defaults first keeps default passwords unchanged.
+pub const DEFAULT_SYMBOLS: &str = "!@#$%^&*-_=+?";
+const ALL_SYMBOLS: &str = "!@#$%^&*-_=+?\"'(),./:;<>[\\]`{|}~";
 
 fn nfkc(s: &str) -> String {
     s.nfkc().collect()
@@ -58,21 +61,38 @@ pub fn site_key(master_key: &Key, site: &str, login: &str, counter: u32) -> Key 
     )
 }
 
-/// §2.3 — `classes` is any non-empty subset of "luds" (lower, upper, digits, symbols).
-pub fn password(site_key: &Key, length: usize, classes: &str) -> Result<String, String> {
-    if !(4..=64).contains(&length) {
-        return Err(format!("length {length} not in 4..=64"));
+/// §2.3 — a site's symbols in canonical order. Any ASCII punctuation, any order, repeats allowed.
+pub fn canonical_symbols(symbols: &str) -> Result<String, String> {
+    if let Some(c) = symbols.chars().find(|&c| !ALL_SYMBOLS.contains(c)) {
+        return Err(format!("{c:?} is not an ASCII symbol"));
     }
+    Ok(ALL_SYMBOLS.chars().filter(|&c| symbols.contains(c)).collect())
+}
+
+fn charset(classes: &str, symbols: &str) -> Result<Vec<String>, String> {
     if classes.is_empty() || classes.chars().any(|c| !"luds".contains(c)) {
         return Err(format!("classes {classes:?} must be a non-empty subset of \"luds\""));
     }
+    let symbols = canonical_symbols(symbols)?;
+    if classes.contains('s') && symbols.is_empty() {
+        return Err("symbols are on but none are allowed".into());
+    }
     // Fixed order regardless of how `classes` is written.
-    let enabled: Vec<&[u8]> = [('l', LOWER), ('u', UPPER), ('d', DIGITS), ('s', SYMBOLS)]
+    Ok([('l', LOWER), ('u', UPPER), ('d', DIGITS), ('s', symbols.as_str())]
         .iter()
         .filter(|(c, _)| classes.contains(*c))
-        .map(|(_, set)| set.as_bytes())
-        .collect();
-    let charset = enabled.concat();
+        .map(|(_, set)| set.to_string())
+        .collect())
+}
+
+/// §2.3 — `classes` is any non-empty subset of "luds" (lower, upper, digits, symbols);
+/// `symbols` is the site's symbol set, used when `classes` has `s`.
+pub fn password(site_key: &Key, length: usize, classes: &str, symbols: &str) -> Result<String, String> {
+    if !(4..=64).contains(&length) {
+        return Err(format!("length {length} not in 4..=64"));
+    }
+    let enabled = charset(classes, symbols)?;
+    let charset = enabled.concat().into_bytes();
     let n = charset.len();
     let limit = 256 - 256 % n;
 
@@ -84,20 +104,18 @@ pub fn password(site_key: &Key, length: usize, classes: &str) -> Result<String, 
             .map(|b| charset[b as usize % n])
             .take(length)
             .collect();
-        if enabled.iter().all(|set| candidate.iter().any(|c| set.contains(c))) {
+        if enabled.iter().all(|set| candidate.iter().any(|c| set.as_bytes().contains(c))) {
             return Ok(String::from_utf8(candidate).expect("charset is ASCII"));
         }
     }
 }
 
 /// Approximate strength of a policy in bits (ignores the small loss from requiring every class).
-pub fn entropy_bits(length: usize, classes: &str) -> f64 {
-    let n: usize = [('l', LOWER), ('u', UPPER), ('d', DIGITS), ('s', SYMBOLS)]
-        .iter()
-        .filter(|(c, _)| classes.contains(*c))
-        .map(|(_, set)| set.len())
-        .sum();
-    if n == 0 { 0.0 } else { length as f64 * (n as f64).log2() }
+pub fn entropy_bits(length: usize, classes: &str, symbols: &str) -> f64 {
+    match charset(classes, symbols) {
+        Ok(sets) => length as f64 * (sets.concat().len() as f64).log2(),
+        Err(_) => 0.0,
+    }
 }
 
 /// §2.4
@@ -129,9 +147,16 @@ pub struct Site {
     pub counter: u32,
     pub length: usize,
     pub classes: String,
+    /// The symbols this site accepts; absent in files written before it existed.
+    #[serde(default = "default_symbols")]
+    pub symbols: String,
     /// Android package names linked to this site; carried through untouched on desktop.
     #[serde(default)]
     pub apps: Vec<String>,
+}
+
+fn default_symbols() -> String {
+    DEFAULT_SYMBOLS.into()
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -214,7 +239,7 @@ mod tests {
             assert_eq!(encode_secret_key(&secret), s("secretKeyText"));
             assert_eq!(decode_secret_key(&s("secretKeyText").to_lowercase().replace(' ', "-")), Some(secret));
             assert_eq!(hex::encode(sk), s("siteKey"));
-            let pw = password(&sk, v["length"].as_u64().unwrap() as usize, s("classes")).unwrap();
+            let pw = password(&sk, v["length"].as_u64().unwrap() as usize, s("classes"), s("symbols")).unwrap();
             assert_eq!(pw, s("password"), "{v}");
         }
     }
@@ -229,10 +254,15 @@ mod tests {
     #[test]
     fn rejects_bad_policy() {
         let sk = [0u8; 32];
-        assert!(password(&sk, 3, "luds").is_err());
-        assert!(password(&sk, 65, "luds").is_err());
-        assert!(password(&sk, 20, "").is_err());
-        assert!(password(&sk, 20, "lx").is_err());
+        let d = DEFAULT_SYMBOLS;
+        assert!(password(&sk, 3, "luds", d).is_err());
+        assert!(password(&sk, 65, "luds", d).is_err());
+        assert!(password(&sk, 20, "", d).is_err());
+        assert!(password(&sk, 20, "lx", d).is_err());
+        assert!(password(&sk, 20, "luds", "").is_err());
+        assert!(password(&sk, 20, "luds", "é").is_err());
+        assert!(password(&sk, 20, "lud", "").is_ok()); // symbols off: the set doesn't matter
+        assert_eq!(canonical_symbols("~.-!!").unwrap(), "!-.~");
     }
 
     #[test]
@@ -244,7 +274,7 @@ mod tests {
             version: 1,
             sites: vec![Site {
                 site: "github.com".into(), login: "bassam".into(), counter: 2,
-                length: 20, classes: "luds".into(), apps: vec!["com.github.android".into()],
+                length: 20, classes: "luds".into(), symbols: "-_".into(), apps: vec!["com.github.android".into()],
             }],
         };
         list.save(&path).unwrap();
@@ -258,12 +288,12 @@ mod tests {
     fn merge_higher_counter_wins() {
         let site = |name: &str, counter| Site {
             site: name.into(), login: String::new(), counter,
-            length: 20, classes: "luds".into(), apps: vec![],
+            length: 20, classes: "luds".into(), symbols: DEFAULT_SYMBOLS.into(), apps: vec![],
         };
         let mut mine = SiteList { version: 1, sites: vec![site("a", 3), site("b", 1)] };
         let counts = mine.merge(SiteList { version: 1, sites: vec![site("a", 2), site(" B", 2), site("c", 1)] });
         assert_eq!(counts, (1, 1));
-        assert_eq!(entropy_bits(20, "luds").round(), 125.0);
+        assert_eq!(entropy_bits(20, "luds", DEFAULT_SYMBOLS).round(), 125.0);
         assert_eq!(mine.sites, vec![site("a", 3), site("b", 2), site("c", 1)]);
     }
 }

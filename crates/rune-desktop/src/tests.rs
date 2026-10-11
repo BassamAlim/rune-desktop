@@ -42,6 +42,7 @@ fn site(name: &str, login: &str) -> Site {
         counter: 1,
         length: 20,
         classes: "luds".into(),
+        symbols: DEFAULT_SYMBOLS.into(),
         apps: vec![],
     }
 }
@@ -54,6 +55,8 @@ fn type_into(harness: &mut Harness<'_, App>, nth: usize, text: &str) {
 }
 
 fn click(harness: &mut Harness<'_, App>, label: &str) {
+    harness.get_by_label_contains(label).scroll_to_me();
+    harness.run();
     harness.get_by_label_contains(label).click();
     harness.run();
 }
@@ -76,10 +79,11 @@ fn add_show_and_delete_a_site() {
     assert_eq!(SiteList::load(&path).unwrap().sites, vec![expected]);
     assert_eq!(harness.state().selected, Some(0));
 
-    let pw = password(&site_key(&MASTER, "github.com", "bassam", 1), 20, "luds").unwrap();
+    let pw = password(&site_key(&MASTER, "github.com", "bassam", 1), 20, "luds", DEFAULT_SYMBOLS).unwrap();
     assert!(harness.query_by_label(&pw).is_none(), "password must be hidden until shown");
     click(&mut harness, "Show password");
     harness.get_by_label(&pw);
+    assert!(harness.query_by_label("Copy previous password").is_none(), "counter 1 has no previous");
 
     click(&mut harness, "Add site");
     type_into(&mut harness, 0, "github.com");
@@ -155,6 +159,14 @@ fn editor_normalises_and_validates() {
     editor.digits = false;
     assert!(editor.to_site().is_err());
     editor.digits = true;
+    editor.symbols = true;
+    editor.symbol_set = "._-".into();
+    assert_eq!(editor.to_site().unwrap().symbols, "-_.");
+    editor.symbol_set = "".into();
+    assert!(editor.to_site().is_err());
+    editor.symbol_set = "é".into();
+    assert!(editor.to_site().is_err());
+    editor.symbols = false;
     editor.site = "   ".into();
     assert!(editor.to_site().is_err());
 }
@@ -169,7 +181,7 @@ fn screenshots() {
     let dir = temp_dir("shots");
     let sites = vec![
         site("bank.example", ""),
-        site("github.com", "bassam"),
+        Site { counter: 2, ..site("github.com", "bassam") },
         site("github.com", "work"),
         site("mail.example", "bassam@example.com"),
         site("news.example", ""),
