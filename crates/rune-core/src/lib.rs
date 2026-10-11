@@ -35,13 +35,38 @@ fn hmac(key: &[u8], parts: &[&[u8]]) -> Key {
 }
 
 /// §2.1 — slow (64 MiB, ~1 s). Run once at setup.
-pub fn master_key(master_password: &str, secret_key: &Key) -> Key {
+pub fn master_key(master_password: &str) -> Key {
     let params = Params::new(65536, 3, 4, Some(32)).expect("fixed params are valid");
     let mut out = [0u8; 32];
     Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
-        .hash_password_into(nfkc(master_password).as_bytes(), secret_key, &mut out)
+        .hash_password_into(nfkc(master_password).as_bytes(), b"rune/v1/master", &mut out)
         .expect("fixed params are valid");
     out
+}
+
+/// §1 — the EFF large wordlist: 7776 words, so each is log2(7776) ≈ 12.9 bits.
+const WORDS: &str = include_str!("../words.txt");
+pub const PASSPHRASE_WORDS: usize = 6;
+
+/// §1 — a generated master password: `PASSPHRASE_WORDS` words, each picked uniformly using
+/// `random`, which must return uniformly random u16s (from the OS).
+pub fn passphrase(mut random: impl FnMut() -> u16) -> String {
+    let words: Vec<&str> = WORDS.lines().collect();
+    let limit = 65536 - 65536 % words.len() as u32;
+    (0..PASSPHRASE_WORDS)
+        .map(|_| loop {
+            let r = random() as u32;
+            if r < limit {
+                break words[r as usize % words.len()];
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Strength of a generated passphrase in bits.
+pub fn passphrase_bits() -> f64 {
+    PASSPHRASE_WORDS as f64 * (WORDS.lines().count() as f64).log2()
 }
 
 /// §2.2
@@ -122,20 +147,6 @@ pub fn entropy_bits(length: usize, classes: &str, symbols: &str) -> f64 {
 pub fn fingerprint(master_key: &Key) -> String {
     let h = hmac(master_key, &[b"rune/v1/check"]);
     format!("{:02x}{:02x}", h[0], h[1])
-}
-
-/// §1 — secret key as text: RFC 4648 Base32, no padding, shown in groups of 4.
-pub fn encode_secret_key(key: &Key) -> String {
-    let text = data_encoding::BASE32_NOPAD.encode(key);
-    let groups: Vec<&str> = (0..text.len()).step_by(4).map(|i| &text[i..i + 4]).collect();
-    groups.join(" ")
-}
-
-/// Accepts any case and ignores spaces, dashes and other separators.
-pub fn decode_secret_key(text: &str) -> Option<Key> {
-    let text: String = text.chars().filter(char::is_ascii_alphanumeric).collect();
-    let bytes = data_encoding::BASE32_NOPAD.decode(text.to_ascii_uppercase().as_bytes()).ok()?;
-    bytes.try_into().ok()
 }
 
 /// §3
@@ -231,13 +242,10 @@ mod tests {
         assert!(!vectors.is_empty());
         for v in &vectors {
             let s = |k: &str| v[k].as_str().unwrap();
-            let secret: Key = hex::decode(s("secretKey")).unwrap().try_into().unwrap();
-            let mk = master_key(s("masterPassword"), &secret);
+            let mk = master_key(s("masterPassword"));
             let sk = site_key(&mk, s("site"), s("login"), v["counter"].as_u64().unwrap() as u32);
             assert_eq!(hex::encode(mk), s("masterKey"));
             assert_eq!(fingerprint(&mk), s("fingerprint"));
-            assert_eq!(encode_secret_key(&secret), s("secretKeyText"));
-            assert_eq!(decode_secret_key(&s("secretKeyText").to_lowercase().replace(' ', "-")), Some(secret));
             assert_eq!(hex::encode(sk), s("siteKey"));
             let pw = password(&sk, v["length"].as_u64().unwrap() as usize, s("classes"), s("symbols")).unwrap();
             assert_eq!(pw, s("password"), "{v}");
@@ -245,10 +253,16 @@ mod tests {
     }
 
     #[test]
-    fn rejects_bad_secret_key_text() {
-        assert_eq!(decode_secret_key(""), None);
-        assert_eq!(decode_secret_key("AAAA AAAA"), None); // too short
-        assert_eq!(decode_secret_key(&"1".repeat(52)), None); // not Base32
+    fn passphrase_is_six_words_from_the_list() {
+        let mut n = 0u16;
+        // Starts in the rejected range: 62208.. never picks a word.
+        let mut values = [65535u16, 62208].into_iter().chain(std::iter::repeat_with(move || { n += 1111; n }));
+        let phrase = passphrase(|| values.next().unwrap());
+        let words: Vec<&str> = phrase.split(' ').collect();
+        assert_eq!(words.len(), 6);
+        assert_eq!(words[0], WORDS.lines().nth(1111).unwrap());
+        assert!(words.iter().all(|w| WORDS.lines().any(|l| l == *w)));
+        assert_eq!(passphrase_bits().round(), 78.0);
     }
 
     #[test]

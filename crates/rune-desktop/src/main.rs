@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use arboard::Clipboard;
 use rune_core::{
-    DEFAULT_SYMBOLS, Site, SiteList, canonical_symbols, decode_secret_key, encode_secret_key, entropy_bits, fingerprint, master_key,
+    DEFAULT_SYMBOLS, Site, SiteList, canonical_symbols, entropy_bits, fingerprint, master_key, passphrase, passphrase_bits,
     normalize, password, site_key,
 };
 use eframe::egui::{self, Align, Key, Layout, RichText, Sense, Ui};
@@ -111,7 +111,6 @@ enum Dialog {
 
 #[derive(Default)]
 struct Settings {
-    reveal: bool,
     confirm_reset: bool,
     message: String,
     /// A file dialog is open on another thread.
@@ -120,9 +119,8 @@ struct Settings {
 
 enum Screen {
     Setup,
-    Deriving { rx: Receiver<Keys>, generated: bool },
-    /// `generated`: the secret key was made here, so it must be backed up before saving.
-    Confirm { keys: Keys, generated: bool, written_down: bool },
+    Deriving { rx: Receiver<Keys> },
+    Confirm { keys: Keys },
     Sites,
     Editor(Editor),
     Settings(Settings),
@@ -135,11 +133,10 @@ struct App {
     error: String,
     mark: Option<egui::TextureHandle>,
 
-    // Setup form
+    // Setup form. `generated` holds the suggested passphrase; `None` means "use my own".
+    generated: Option<String>,
     password: String,
     confirm: String,
-    have_secret_key: bool,
-    secret_key_text: String,
 
     // Set once setup is done
     keys: Option<Keys>,
@@ -165,10 +162,9 @@ impl App {
             screen: Screen::Setup,
             error: String::new(),
             mark: None,
+            generated: Some(new_passphrase()),
             password: String::new(),
             confirm: String::new(),
-            have_secret_key: false,
-            secret_key_text: String::new(),
             keys: None,
             sites: SiteList { version: 1, sites: vec![] },
             sites_path,
@@ -229,21 +225,50 @@ impl App {
         });
         ui.add_space(16.0);
 
-        theme::field(ui, "Master password", |ui| {
-            ui.add(theme::text_field(&mut self.password).password(true))
+        ui.horizontal(|ui| {
+            if ui.selectable_label(self.generated.is_some(), "Generate one").clicked() && self.generated.is_none() {
+                self.generated = Some(new_passphrase());
+                self.password.zeroize();
+                self.confirm.zeroize();
+            }
+            if ui.selectable_label(self.generated.is_none(), "Use my own").clicked() {
+                if let Some(mut phrase) = self.generated.take() {
+                    phrase.zeroize();
+                }
+                self.confirm.zeroize();
+            }
         });
-        theme::field(ui, "Repeat master password", |ui| {
-            ui.add(theme::text_field(&mut self.confirm).password(true))
-        });
-        theme::checkbox(ui, &mut self.have_secret_key, "I have a secret key from another device");
-        if self.have_secret_key {
-            theme::field(ui, "Secret key", |ui| {
-                ui.add(
-                    theme::text_field(&mut self.secret_key_text)
-                        .font(egui::TextStyle::Monospace)
-                        .hint_text("52 characters, spaces optional"),
-                )
+        ui.add_space(4.0);
+
+        if let Some(phrase) = &mut self.generated {
+            theme::card().show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(theme::small("Your master password"));
+                ui.add(egui::Label::new(RichText::new(phrase.as_str()).monospace().size(18.0).color(theme::ACCENT)).wrap());
+                if ui.add(theme::button(icon::ARROWS_CLOCKWISE, "New words")).clicked() {
+                    phrase.zeroize();
+                    *phrase = new_passphrase();
+                }
+                ui.label(theme::small(
+                    "Write it down until you know it by heart. Forgetting it loses every password.",
+                ));
             });
+            theme::field(ui, "Type it back", |ui| ui.add(theme::text_field(&mut self.confirm)));
+            ui.label(theme::small(format!(
+                "{:.0} bits: out of reach even if a site leaks one of your passwords.",
+                passphrase_bits()
+            )));
+        } else {
+            theme::field(ui, "Master password", |ui| {
+                ui.add(theme::text_field(&mut self.password).password(true))
+            });
+            theme::field(ui, "Repeat master password", |ui| {
+                ui.add(theme::text_field(&mut self.confirm).password(true))
+            });
+            if !self.password.is_empty() {
+                let (text, color) = strength(&self.password);
+                ui.add(egui::Label::new(RichText::new(text).size(13.0).color(color)).wrap());
+            }
         }
         ui.add_space(8.0);
         let submit = ui.add_sized([ui.available_width(), 40.0], theme::primary_button("", "Continue")).clicked()
@@ -252,81 +277,66 @@ impl App {
             return None;
         }
 
-        let secret = if self.password.is_empty() {
-            Err("Enter a master password.".to_string())
-        } else if self.password != self.confirm {
-            Err("The two passwords don't match.".to_string())
-        } else if self.have_secret_key {
-            decode_secret_key(&self.secret_key_text).ok_or("That isn't a valid secret key.".to_string())
-        } else {
-            store::random_key().map_err(|e| format!("Can't generate a secret key: {e}"))
+        let words = |s: &str| s.split_whitespace().map(str::to_lowercase).collect::<Vec<_>>();
+        let checked = match &self.generated {
+            Some(phrase) if words(phrase) == words(&self.confirm) => Ok(phrase.clone()),
+            Some(_) => Err("That doesn't match the words above."),
+            None if self.password.is_empty() => Err("Enter a master password."),
+            None if self.password != self.confirm => Err("The two passwords don't match."),
+            None => Ok(std::mem::take(&mut self.password)),
         };
-        let secret = match secret {
-            Ok(secret) => secret,
+        let mut password = match checked {
+            Ok(password) => password,
             Err(e) => {
-                self.error = e;
+                self.error = e.to_string();
                 return None;
             }
         };
         self.error.clear();
+        self.confirm.zeroize();
 
         // Argon2id takes about a second; keep it off the UI thread.
         let (tx, rx) = mpsc::channel();
-        let mut password = std::mem::take(&mut self.password);
-        self.confirm.zeroize();
-        self.secret_key_text.zeroize();
         let ctx = ui.ctx().clone();
         std::thread::spawn(move || {
-            let master = master_key(&password, &secret);
+            let master = master_key(&password);
             password.zeroize();
-            let _ = tx.send(Keys { secret, master });
+            let _ = tx.send(Keys { master });
             ctx.request_repaint();
         });
-        Some(Screen::Deriving { rx, generated: !self.have_secret_key })
+        Some(Screen::Deriving { rx })
     }
 
     fn confirm_screen(&mut self, ui: &mut Ui) -> Option<Screen> {
-        let Screen::Confirm { keys, generated, written_down } = &mut self.screen else {
+        let Screen::Confirm { keys } = &mut self.screen else {
             return None;
         };
         let mut next = None;
         ui.add_space(8.0);
-        ui.heading(if *generated { "Save your secret key" } else { "Check your fingerprint" });
+        ui.heading("Check your fingerprint");
         ui.add_space(8.0);
 
         theme::card().show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.label(theme::small("Key fingerprint"));
             ui.label(RichText::new(fingerprint(&keys.master)).monospace().size(28.0).color(theme::ACCENT));
-            ui.label(theme::small(if *generated {
-                "Every device set up with the same master password and secret key shows this."
-            } else {
-                "This must match the fingerprint on your other device. If it doesn't, go back and retype the master password."
-            }));
+            ui.label(theme::small(
+                "Every device with the same master password shows this. If you use Rune on another \
+                 device and its fingerprint differs, go back and retype the master password.",
+            ));
         });
-        if *generated {
-            theme::card().show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.label(theme::small("Secret key"));
-                ui.add(egui::Label::new(RichText::new(encode_secret_key(&keys.secret)).monospace()).wrap());
-                secret_key_qr(ui, &keys.secret);
-                ui.label(theme::small(
-                    "Write this down and keep it somewhere safe. A new device needs it together with \
-                     your master password; a phone can scan the code instead. It can't be recovered if you lose it.",
-                ));
-            });
-            theme::checkbox(ui, written_down, "I have written down my secret key");
-        }
         ui.add_space(8.0);
         ui.horizontal(|ui| {
             if ui.button("Back").clicked() {
                 next = Some(Screen::Setup);
             }
-            let ready = !*generated || *written_down;
-            if ui.add_enabled(ready, theme::primary_button("", "Save and continue")).clicked() {
+            if ui.add(theme::primary_button("", "Save and continue")).clicked() {
                 match store::save_keys(store::ACCOUNT, keys) {
                     Ok(()) => {
                         self.keys = Some(Keys { ..*keys });
+                        if let Some(mut phrase) = self.generated.take() {
+                            phrase.zeroize();
+                        }
                         self.error.clear();
                         self.focus_search = true;
                         next = Some(Screen::Sites);
@@ -757,16 +767,9 @@ impl App {
                 ui.label(theme::muted("Fingerprint"));
                 ui.label(RichText::new(fingerprint(&keys.master)).monospace().color(theme::ACCENT));
             });
-            if settings.reveal {
-                ui.add(egui::Label::new(RichText::new(encode_secret_key(&keys.secret)).monospace()).wrap());
-                secret_key_qr(ui, &keys.secret);
-                ui.label(theme::small("Setting up your phone? Scan this from its setup screen."));
-            }
-            let label = if settings.reveal { "Hide secret key" } else { "Show secret key" };
-            if ui.button(label).clicked() {
-                settings.reveal = !settings.reveal;
-            }
-            ui.label(theme::small("A new device needs the secret key together with your master password."));
+            ui.label(theme::small(
+                "A new device needs only your master password; matching fingerprints show it was typed right.",
+            ));
         });
 
         theme::card().show(ui, |ui| {
@@ -796,7 +799,7 @@ impl App {
             ui.label(RichText::new("Reset").strong());
             ui.label(theme::small(
                 "Removes your keys from this computer. Your site list stays. To use Rune again here \
-                 you need your master password and secret key.",
+                 you need your master password.",
             ));
             ui.horizontal(|ui| {
                 if !settings.confirm_reset {
@@ -869,14 +872,14 @@ impl App {
         let next = egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
             let next = match &self.screen {
                 Screen::Setup => self.setup_screen(ui),
-                Screen::Deriving { rx, generated } => {
+                Screen::Deriving { rx } => {
                     let received = rx.try_recv().ok();
                     ui.add_space(ui.available_height() * 0.35);
                     ui.vertical_centered(|ui| {
                         ui.spinner();
                         ui.label(theme::muted("Deriving your key…"));
                     });
-                    received.map(|keys| Screen::Confirm { keys, generated: *generated, written_down: false })
+                    received.map(|keys| Screen::Confirm { keys })
                 }
                 Screen::Confirm { .. } => self.confirm_screen(ui),
                 Screen::Sites => unreachable!("drawn above"),
@@ -901,24 +904,29 @@ impl App {
     }
 }
 
-/// The secret key as a QR code, for the phone to scan at setup. Dark on light with the standard
-/// quiet zone, whatever the theme: that is what scanners read reliably.
-fn secret_key_qr(ui: &mut Ui, key: &rune_core::Key) {
-    let code = qrcode::QrCode::new(encode_secret_key(key)).expect("52 characters always fit");
-    let modules = code.width() + 8;
-    let side = 200.0;
-    let (rect, _) = ui.allocate_exact_size(egui::Vec2::splat(side), Sense::hover());
-    let painter = ui.painter_at(rect);
-    painter.rect_filled(rect, theme::RADIUS, egui::Color32::WHITE);
-    let cell = side / modules as f32;
-    for (i, color) in code.to_colors().into_iter().enumerate() {
-        if color == qrcode::Color::Dark {
-            let (x, y) = ((i % code.width() + 4) as f32, (i / code.width() + 4) as f32);
-            let min = rect.min + egui::vec2(x * cell, y * cell);
-            // A hair of overlap so no seams show between neighbouring modules.
-            painter.rect_filled(egui::Rect::from_min_size(min, egui::Vec2::splat(cell + 0.5)), 0, egui::Color32::BLACK);
-        }
-    }
+/// Six fresh words from the OS's randomness.
+fn new_passphrase() -> String {
+    passphrase(|| store::random_u16().expect("/dev/urandom is readable"))
+}
+
+/// How long a well-equipped attacker (~100,000 guesses a second: Argon2 on a rack of GPUs)
+/// would take to guess `password` after a site leaks one of its passwords.
+fn strength(password: &str) -> (String, egui::Color32) {
+    const GUESSES_PER_SECOND: f64 = 1e5;
+    let seconds = zxcvbn::zxcvbn(password, &["rune"]).guesses() as f64 / GUESSES_PER_SECOND;
+    let (day, year) = (86400.0, 3.15e7);
+    let about = |n: f64, unit: &str| {
+        let n = n.round().max(1.0);
+        format!("about {n} {unit}{}", if n == 1.0 { "" } else { "s" })
+    };
+    let (when, color) = match seconds {
+        s if s < 3600.0 => ("under an hour".to_string(), theme::DANGER),
+        s if s < day * 30.0 => (about(s / day, "day"), theme::DANGER),
+        s if s < year => (about(s / (day * 30.0), "month"), theme::DANGER),
+        s if s < year * 1000.0 => (about(s / year, "year"), theme::MUTED),
+        _ => ("thousands of years or more".to_string(), theme::ACCENT),
+    };
+    (format!("If a site leaks one of your passwords, guessing this would take {when}."), color)
 }
 
 /// Back arrow and title. Returns true when back was clicked.

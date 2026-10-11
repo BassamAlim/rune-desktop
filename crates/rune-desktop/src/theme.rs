@@ -157,18 +157,6 @@ pub fn note(ui: &mut Ui, glyph: &str, text: &str, color: Color32) -> Response {
     ui.add(egui::Label::new(icon_text(glyph, text, color, 13.0)).wrap())
 }
 
-/// A checkbox with a square box; the global widget radius would make it look like a radio button.
-pub fn checkbox(ui: &mut Ui, checked: &mut bool, text: &str) -> Response {
-    ui.scope(|ui| {
-        let widgets = &mut ui.visuals_mut().widgets;
-        for state in [&mut widgets.inactive, &mut widgets.hovered, &mut widgets.active] {
-            state.corner_radius = CornerRadius::same(5);
-        }
-        ui.checkbox(checked, text)
-    })
-    .inner
-}
-
 pub fn card() -> egui::Frame {
     egui::Frame::new()
         .fill(SURFACE)

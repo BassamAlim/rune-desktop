@@ -14,15 +14,22 @@ Both implement the algorithm below independently and must pass the same `vectors
 | Secret | What | Where it lives |
 |---|---|---|
 | Master password | Memorised by the user | Nowhere. Discarded after key derivation. |
-| Secret key | 32 random bytes generated at first setup | On each device; backed up once by the user as Base32 text |
-| Master key | Derived from the two above | On each device, encrypted (see §4) |
+| Master key | Derived from the master password | On each device, encrypted (see §4) |
 
-The secret key is what makes a leaked site password useless for guessing the master password.
-A new device needs both the master password and the secret key.
+The master password is the only secret, so a new device needs only it. It is also the only
+defence once a site leaks one of its passwords: the attacker can then guess master passwords
+offline at Argon2id cost (§8). Setup therefore offers a generated one by default:
 
-Secret key as text: RFC 4648 Base32, no padding (52 characters), shown in groups of 4.
-Input ignores case, spaces and dashes. The desktop also shows the key as a QR code (the same text);
-the phone's setup screen scans it on-device, so the key never has to be typed on the phone.
+- **Generated:** 6 words picked uniformly (OS randomness, rejection sampling) from the EFF large
+  wordlist (7776 words, `rune-core/words.txt`, copied to Android as `res/raw/words.txt`), joined
+  by single spaces: ≈ 77.5 bits. The user types it back once; case and spacing are ignored for
+  that check only — the derivation uses the generated text.
+- **Own:** typed twice, with a zxcvbn estimate shown as the time to guess it at ~10⁵ guesses/s.
+  Weak passwords are warned about, never refused.
+
+Fingerprint unlock means the master password is rarely typed, and forgetting it loses everything.
+So on Android, once it hasn't been typed for 14 days, the next unlock asks for it instead of the
+fingerprint ("practice"). It can be skipped for that unlock; the next one asks again.
 
 ## 2. Algorithm (`rune/v1`)
 
@@ -33,7 +40,7 @@ All strings are UTF-8 after NFKC normalisation. `u32be(x)` is a 4-byte big-endia
 ```
 masterKey = Argon2id(
     password = masterPassword,
-    salt     = secretKey,          # 32 bytes
+    salt     = "rune/v1/master",   # fixed: Rune has one user, so there is no crowd to precompute against
     m = 65536 KiB (64 MiB), t = 3, p = 4, version = 0x13,
     length   = 32)
 ```
@@ -124,14 +131,13 @@ with type-safe routes, one `StateFlow<UiState>` per ViewModel.
   `setUserAuthenticationRequired(true)`, `setUserAuthenticationParameters(0, AUTH_BIOMETRIC_STRONG)`,
   StrongBox if available, TEE otherwise.
 - Every use shows a `BiometricPrompt` bound to the decrypt `Cipher` via `CryptoObject`. The decrypted key is used for one operation and zeroed.
-- Secret key encrypted with a second Keystore key that needs no user authentication, so the master-password fallback works.
 - Fallback when biometrics fail or the key is invalidated by new enrolment: enter the master password → re-derive → check fingerprint. No device-PIN fallback.
 - A phone with no fingerprint enrolled still works: the master key is simply not stored, and the master password is asked for each time. Fingerprint unlock is turned on (or back on) from Settings.
-- Showing the secret key in Settings is gated by a plain presence check (fingerprint or screen lock), not by a key: the app can already read it.
+- Stored alongside: the key fingerprint, and when the master password was last typed (for practice, §1).
 
 ### 4.2 Screens
 
-1. **Setup** — master password twice, or join an existing key by typing the secret key; then the fingerprint and the secret key to write down; then the fingerprint sheet that seals the master key.
+1. **Setup** — a generated passphrase typed back, or your own master password twice; then the fingerprint to compare with other devices; then the fingerprint sheet that seals the master key.
 2. **Sites** — searchable list of names and logins. Holds no secrets, so it has no lock.
 3. **Site** — opening it asks for the fingerprint; the password is shown masked with reveal and copy, and forgotten when the screen is left. When the counter is above 1, the previous password (counter − 1) can be copied too, for a site's change-password form; it comes from the same unlock.
 4. **Editor** — site, login, counter, length, classes, allowed symbols; delete behind a confirmation.
@@ -151,7 +157,7 @@ with type-safe routes, one `StateFlow<UiState>` per ViewModel.
 
 ### 4.5 Hardening
 
-- No `INTERNET` permission. `CAMERA` only for scanning the secret key at setup, decoded on the phone by zxing. `FLAG_SECURE` on both activities. `allowBackup="false"` and everything excluded from device transfer.
+- No `INTERNET` permission. `FLAG_SECURE` on both activities. `allowBackup="false"` and everything excluded from device transfer.
 
 ### 4.6 Stack
 
@@ -162,7 +168,7 @@ Kotlin, Jetpack Compose (Material 3), Hilt, Navigation Compose, DataStore, `andr
 
 - One Cargo workspace: `rune-core` (library: algorithm + site list, no I/O beyond the JSON file) and `rune-desktop` (GUI binary).
 - GUI: `eframe`/`egui`, native Wayland. Screens: setup, sites (list with the selected site's password in a card below, and the previous password to copy when the counter is above 1), site editor, settings.
-- Master key and secret key stored in the Secret Service keyring (KWallet on KDE) via the `keyring` crate; secret key entered once as Base32 text from the phone. Anyone at the unlocked desktop session can open Rune — the keyring is the lock.
+- Master key stored in the Secret Service keyring (KWallet on KDE) via the `keyring` crate. Setup is the same as Android's (generated or own). Anyone at the unlocked desktop session can open Rune — the keyring is the lock.
 - Copy flags the password so clipboard managers (Klipper) keep it out of history, and clears it after 30 s if it is still what is on the clipboard.
 - Site list at `$XDG_DATA_HOME/rune/sites.json`. Export and import through the system file dialog.
 - This repo owns `SPEC.md` and `vectors.json`; `cargo run -p rune-core --example gen-vectors` regenerates the vectors. `rune-android` holds a copy of `vectors.json` only.
@@ -179,7 +185,7 @@ vector drawables.
 
 ## 6. Tests
 
-- `vectors.json`: fixed (master password, secret key, site, login, counter, policy) → expected master key, site key, password, fingerprint. Generated by the Rust core, checked into both repos, asserted by both.
+- `vectors.json`: fixed (master password, site, login, counter, policy) → expected master key, site key, password, fingerprint. Generated by the Rust core, checked into both repos, asserted by both.
 - Before the vectors are frozen, one vector is confirmed by a throwaway third implementation (Python, `argon2-cffi` + stdlib `hmac`), so the two apps can't simply agree on the same mistake.
 - Must include: empty login, non-ASCII site name, a policy that forces a rejected candidate, counter 2.
 
@@ -194,6 +200,6 @@ vector drawables.
 
 ## 8. Known limits
 
-- Changing the master password or losing the secret key changes every password.
-- An attacker with the secret key **and** one site password can guess the master password offline at Argon2id cost.
+- Changing or forgetting the master password changes or loses every password.
+- An attacker with one site password can guess the master password offline at Argon2id cost: a generated passphrase is out of reach, a weak own password is not.
 - The clipboard is readable by other apps while the password is on it; prefer autofill.

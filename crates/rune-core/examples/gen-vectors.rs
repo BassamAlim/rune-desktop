@@ -5,7 +5,6 @@ use rune_core::*;
 use serde_json::json;
 
 fn main() {
-    let secret: Key = core::array::from_fn(|i| i as u8);
     let d = DEFAULT_SYMBOLS;
     // (master password, site, login, counter, length, classes, symbols)
     let cases = [
@@ -24,11 +23,10 @@ fn main() {
     let vectors: Vec<_> = cases
         .iter()
         .map(|&(pw, site, login, counter, length, classes, symbols)| {
-            let mk = master_key(pw, &secret);
+            let mk = master_key(pw);
             let sk = site_key(&mk, site, login, counter);
             json!({
-                "masterPassword": pw, "secretKey": hex::encode(secret),
-                "secretKeyText": encode_secret_key(&secret),
+                "masterPassword": pw,
                 "site": site, "login": login, "counter": counter,
                 "length": length, "classes": classes, "symbols": symbols,
                 "masterKey": hex::encode(mk), "fingerprint": fingerprint(&mk),

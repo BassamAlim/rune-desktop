@@ -14,7 +14,7 @@ fn temp_dir(name: &str) -> PathBuf {
 }
 
 fn app_with_keys(sites_path: PathBuf) -> App {
-    App::start(sites_path, Ok(Some(Keys { secret: [0; 32], master: MASTER })))
+    App::start(sites_path, Ok(Some(Keys { master: MASTER })))
 }
 
 fn harness(app: App, builder: egui_kittest::HarnessBuilder<App>) -> Harness<'static, App> {
@@ -171,6 +171,30 @@ fn editor_normalises_and_validates() {
     assert!(editor.to_site().is_err());
 }
 
+#[test]
+fn setup_checks_the_typed_back_words() {
+    let mut app = App::start(temp_dir("setup").join("sites.json"), Ok(None));
+    app.generated = Some("velvet orbit candle mosaic frosty lantern".into());
+    let mut harness = harness(app, Harness::builder());
+    type_into(&mut harness, 0, "velvet orbit candle");
+    click(&mut harness, "Continue");
+    assert!(matches!(harness.state().screen, Screen::Setup));
+    assert_eq!(harness.state().error, "That doesn't match the words above.");
+
+    // Case and extra spaces don't matter when typing it back.
+    type_into(&mut harness, 0, " Mosaic frosty  lantern");
+    harness.get_by_label_contains("Continue").click();
+    harness.step(); // the next screen spins while Argon2 runs, so it never settles
+    assert!(matches!(harness.state().screen, Screen::Deriving { .. }));
+}
+
+#[test]
+fn strength_ranks_common_passwords_weak_and_passphrases_strong() {
+    assert_eq!(strength("Bassam2024!").1, theme::DANGER);
+    assert_eq!(strength("password123").1, theme::DANGER);
+    assert_eq!(strength("velvet orbit candle mosaic frosty lantern").1, theme::ACCENT);
+}
+
 /// Renders every screen to target/screenshots/ for a visual check:
 /// `cargo test -p rune-desktop -- --ignored screenshots`
 #[test]
@@ -198,14 +222,11 @@ fn screenshots() {
     shoot("1-setup", &|app| {
         app.keys = None;
         app.screen = Screen::Setup;
+        app.generated = Some("velvet orbit candle mosaic frosty lantern".into());
         app.focus_search = false;
     });
     shoot("2-confirm", &|app| {
-        app.screen = Screen::Confirm {
-            keys: Keys { secret: core::array::from_fn(|i| i as u8 * 7), master: MASTER },
-            generated: true,
-            written_down: false,
-        };
+        app.screen = Screen::Confirm { keys: Keys { master: MASTER } };
     });
     shoot("3-empty", &|_| {});
     shoot("4-sites", &|app| {
@@ -221,11 +242,12 @@ fn screenshots() {
         app.sites.sites = sites.clone();
         app.screen = Screen::Settings(Settings { message: "Imported: 2 new, 1 updated.".into(), ..Default::default() });
     });
-    shoot("8-setup-with-key", &|app| {
+    shoot("8-setup-own", &|app| {
         app.keys = None;
         app.screen = Screen::Setup;
-        app.have_secret_key = true;
-        app.error = "That isn't a valid secret key.".into();
+        app.generated = None;
+        app.password = "Bassam2024!".into();
+        app.error = "The two passwords don't match.".into();
     });
     shoot("7-error", &|app| {
         app.sites.sites = sites.clone();

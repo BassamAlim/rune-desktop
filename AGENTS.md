@@ -1,13 +1,15 @@
 # AGENTS.md
 
-Rune for Linux: a deterministic password generator. One master password plus a secret key
-become a different password for every site; passwords are derived, never stored. `README.md`
+Rune for Linux: a deterministic password generator. One master password becomes a
+different password for every site; passwords are derived, never stored. `README.md`
 has the layout, commands and where data lives.
 
 This repo is the **contract owner** for both apps. `SPEC.md` (algorithm, site-list format,
 security model) and `vectors.json` live here; the sibling `rune-android` repo holds a copy of
 the vectors and must produce identical passwords. A change to either file is a change to both
 apps: copy `vectors.json` to `rune-android/app/src/test/resources/` in the same piece of work.
+The passphrase wordlist `crates/rune-core/words.txt` is shared the same way, as
+`rune-android/app/src/main/res/raw/words.txt`.
 
 ## Rules that matter
 

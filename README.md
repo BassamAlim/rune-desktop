@@ -6,7 +6,7 @@
 
 <p align="center">
   <b>A deterministic password generator for Linux.</b><br />
-  One master password and a secret key become a different password for every site. No password is ever stored.
+  One master password becomes a different password for every site. No password is ever stored.
 </p>
 
 ![Setup, the site list with a password, the site editor and settings](docs/images/screens.png)
@@ -19,16 +19,16 @@ data.
 
 ## Features
 
-- **Nothing to steal.** Passwords are worked out from your master password, a secret key held
-  on the device, and the site's name. They are never written to disk.
+- **Nothing to steal.** Passwords are worked out from your master password and the site's
+  name. They are never written to disk.
 - **Sites.** A searchable list of site names and logins. Two logins on one site get two
   different passwords.
 - **Per-site settings.** Length, which kinds of character, and a counter you raise to get a
   new password for that site.
 - **Careful copy.** A copied password is kept out of clipboard history and cleared after 30
   seconds if it is still on the clipboard.
-- **Same passwords on your phone.** Set both apps up with the same master password and secret
-  key; the four-character fingerprint shows they match.
+- **Same passwords on your phone.** Set both apps up with the same master password; the
+  four-character fingerprint shows they match.
 - **Export and import.** The site list is one JSON file, shared with the Android app.
 
 ## Layout

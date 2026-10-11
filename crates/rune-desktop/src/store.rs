@@ -13,28 +13,24 @@ pub const ACCOUNT: &str = "keys";
 pub const CLIPBOARD_CLEAR_AFTER: Duration = Duration::from_secs(30);
 
 pub struct Keys {
-    pub secret: Key,
     pub master: Key,
 }
 
 impl Drop for Keys {
     fn drop(&mut self) {
-        self.secret.zeroize();
         self.master.zeroize();
     }
 }
 
-/// Stored as one 64-byte keyring secret: secret key ‖ master key.
+/// Stored as one 32-byte keyring secret: the master key.
 pub fn load_keys(account: &str) -> Result<Option<Keys>, String> {
     let entry = keyring::Entry::new(SERVICE, account).map_err(|e| e.to_string())?;
     match entry.get_secret() {
         Ok(mut bytes) => {
-            let keys = match bytes.as_slice().split_at_checked(32) {
-                Some((secret, master)) if master.len() == 32 => Ok(Some(Keys {
-                    secret: secret.try_into().unwrap(),
-                    master: master.try_into().unwrap(),
-                })),
-                _ => Err("the stored Rune keys are corrupt".to_string()),
+            let keys = match <[u8; 32]>::try_from(bytes.as_slice()) {
+                Ok(master) => Ok(Some(Keys { master })),
+                // 64 bytes is the older secret key ‖ master key layout.
+                Err(_) => Err("the stored keys are from an older Rune; set it up again".to_string()),
             };
             bytes.zeroize();
             keys
@@ -45,12 +41,9 @@ pub fn load_keys(account: &str) -> Result<Option<Keys>, String> {
 }
 
 pub fn save_keys(account: &str, keys: &Keys) -> Result<(), String> {
-    let mut bytes = [keys.secret, keys.master].concat();
-    let result = keyring::Entry::new(SERVICE, account)
-        .and_then(|entry| entry.set_secret(&bytes))
-        .map_err(|e| e.to_string());
-    bytes.zeroize();
-    result
+    keyring::Entry::new(SERVICE, account)
+        .and_then(|entry| entry.set_secret(&keys.master))
+        .map_err(|e| e.to_string())
 }
 
 pub fn delete_keys(account: &str) -> Result<(), String> {
@@ -60,10 +53,10 @@ pub fn delete_keys(account: &str) -> Result<(), String> {
     }
 }
 
-pub fn random_key() -> std::io::Result<Key> {
-    let mut key = [0u8; 32];
-    std::fs::File::open("/dev/urandom")?.read_exact(&mut key)?;
-    Ok(key)
+pub fn random_u16() -> std::io::Result<u16> {
+    let mut bytes = [0u8; 2];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    Ok(u16::from_le_bytes(bytes))
 }
 
 pub fn sites_path() -> PathBuf {
@@ -102,10 +95,10 @@ mod tests {
     #[ignore = "writes to the real session keyring"]
     fn keyring_roundtrip() {
         let account = "test";
-        let keys = Keys { secret: [1; 32], master: [2; 32] };
+        let keys = Keys { master: [2; 32] };
         save_keys(account, &keys).unwrap();
         let loaded = load_keys(account).unwrap().unwrap();
-        assert_eq!((loaded.secret, loaded.master), (keys.secret, keys.master));
+        assert_eq!(loaded.master, keys.master);
         delete_keys(account).unwrap();
         assert!(load_keys(account).unwrap().is_none());
         delete_keys(account).unwrap(); // deleting twice is fine
