@@ -192,3 +192,38 @@ pub fn password_field(ui: &mut Ui, text: &mut String, shown: &mut bool) -> Respo
 pub fn text_field(text: &mut String) -> egui::TextEdit<'_> {
     egui::TextEdit::singleline(text).desired_width(f32::INFINITY).margin(Margin::symmetric(12, 9))
 }
+
+/// The tile behind a site's logo. A logo with its own solid background (Wikipedia's white
+/// square) gets that colour, so the two read as one. A transparent one gets a light tile when it
+/// is dark, otherwise a faint wash of its own colour, like the letter tiles' amber wash.
+pub fn tile_color(image: &egui::ColorImage) -> Color32 {
+    let [width, height] = image.size;
+    let pixels: Vec<[u8; 4]> = image.pixels.iter().map(|p| p.to_srgba_unmultiplied()).collect();
+    let average = |of: &[[u8; 4]]| -> [u8; 3] {
+        let sum = |c: usize| (of.iter().map(|p| p[c] as usize).sum::<usize>() / of.len()) as u8;
+        [sum(0), sum(1), sum(2)]
+    };
+
+    let edge: Vec<[u8; 4]> = pixels
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| {
+            let (x, y) = (i % width, i / width);
+            x == 0 || y == 0 || x == width - 1 || y == height - 1
+        })
+        .map(|(_, p)| *p)
+        .collect();
+    let solid_edge: Vec<[u8; 4]> = edge.iter().copied().filter(|p| p[3] > 200).collect();
+    if !solid_edge.is_empty() && solid_edge.len() as f32 >= edge.len() as f32 * 0.6 {
+        let [r, g, b] = average(&solid_edge);
+        return Color32::from_rgb(r, g, b);
+    }
+
+    let solid: Vec<[u8; 4]> = pixels.iter().copied().filter(|p| p[3] > 128).collect();
+    if solid.is_empty() {
+        return TEXT;
+    }
+    let [r, g, b] = average(&solid);
+    let luminance = (0.2126 * r as f32 + 0.7152 * g as f32 + 0.0722 * b as f32) / 255.0;
+    if luminance < 0.4 { TEXT } else { Color32::from_rgba_unmultiplied(r, g, b, 0x29) }
+}

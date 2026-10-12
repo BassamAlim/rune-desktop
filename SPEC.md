@@ -113,12 +113,13 @@ Not secret, but required: a lost counter or policy means a lost password.
   "sites": [
     { "site": "github.com", "login": "bassam", "counter": 1,
       "length": 16, "classes": "luds", "symbols": "!@#$%^&*-_=+?",
-      "apps": ["com.github.android"] }
+      "apps": ["com.github.android"], "note": "username: bassam_m" }
   ]
 }
 ```
 
 - `symbols` is stored in canonical order and may be absent (files from before it existed): absent means the default.
+- `note` is free text kept with the login (e.g. a username when the login is an email), stored as typed. Not secret, not part of the password; absent means empty.
 - One JSON file in app-private storage; the same format is the export/import file.
 - Export and import are manual, through the system file picker. Import merges by `(site, login)`; the higher counter wins.
 - The same file moves the list between phone and desktop.
@@ -161,7 +162,7 @@ with type-safe routes, one `StateFlow<UiState>` per ViewModel.
 
 ### 4.5 Hardening
 
-- No `INTERNET` permission. `FLAG_SECURE` on both activities. `allowBackup="false"` and everything excluded from device transfer.
+- `INTERNET` only to fetch each site's `https://<site>/favicon.ico` and homepage, for its avatar and a display name (both apps do this; the stored name and the password never change). The request carries the site name and nothing else; no secret or derived value is ever sent. `FLAG_SECURE` on both activities. `allowBackup="false"` and everything excluded from device transfer.
 
 ### 4.6 Stack
 

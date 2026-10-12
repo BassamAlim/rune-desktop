@@ -7,12 +7,13 @@ edition = "2024"
 arboard = { version = "3.6.1", default-features = false, features = ["wayland-data-control"] }
 rune-core = { version = "0.1.0", path = "../rune-core" }
 eframe = "0.36.2"
+image = { version = "0.25.10", default-features = false, features = ["png", "ico"] }
 egui-phosphor = "0.14.0"
 keyring = "4.2.0"
 rfd = "0.17.2"
+ureq = "2.12.1"
 zeroize = "1.9.1"
 zxcvbn = "3.1.1"
 
 [dev-dependencies]
 egui_kittest = { version = "0.36", features = ["wgpu", "snapshot"] }
-image = { version = "0.25.10", default-features = false, features = ["png"] }

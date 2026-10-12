@@ -20,7 +20,9 @@ The passphrase wordlist `crates/rune-core/words.txt` is shared the same way, as
   are wiped with `zeroize` once consumed; a new field holding a secret gets the same treatment.
 - **An unreadable site list stops the app** (`Screen::Fatal`) rather than starting empty:
   counters can't be recomputed, so overwriting the file loses passwords.
-- **Machine access goes through `store.rs`**: keyring, clipboard, paths, randomness. `main.rs`
+- **Machine access goes through `store.rs`**: keyring, clipboard, paths, randomness, and the
+  only network requests (each site's `/favicon.ico` and homepage, for its logo and display name,
+  cached under `~/.cache/rune/icons` and `names`). `main.rs`
   stays screens only, which keeps the screens testable with `egui_kittest`.
 
 ## Design

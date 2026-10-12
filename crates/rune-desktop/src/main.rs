@@ -1,6 +1,7 @@
 mod store;
 mod theme;
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
@@ -32,6 +33,7 @@ struct Editor {
     symbols: bool,
     symbol_set: String,
     apps: Vec<String>,
+    note: String,
     confirm_delete: bool,
     focus_site: bool,
 }
@@ -50,6 +52,7 @@ impl Editor {
             symbols: site.classes.contains('s'),
             symbol_set: site.symbols.clone(),
             apps: site.apps.clone(),
+            note: site.note.clone(),
             confirm_delete: false,
             focus_site: index.is_none(),
         }
@@ -66,6 +69,7 @@ impl Editor {
                 classes: "luds".to_string(),
                 symbols: DEFAULT_SYMBOLS.to_string(),
                 apps: vec![],
+                note: String::new(),
             },
         )
     }
@@ -99,6 +103,8 @@ impl Editor {
             classes,
             symbols,
             apps: self.apps.clone(),
+            // Kept as typed: a username's case can matter.
+            note: self.note.trim().to_owned(),
         })
     }
 }
@@ -151,11 +157,17 @@ struct App {
     show_password: bool,
     clipboard: Option<Clipboard>,
     copied_at: Option<Instant>,
+    /// Favicons and their tile colours by site name, once settled; `None` for a site that has none.
+    icons: HashMap<String, Option<(egui::TextureHandle, egui::Color32)>>,
+    /// Names sites give themselves ("GitHub"), once settled; `None` for a site that gives none.
+    names: HashMap<String, Option<String>>,
+    /// Off in tests, so rendering a screen never touches the network.
+    fetch_icons: bool,
 }
 
 impl App {
     fn new() -> Self {
-        Self::start(store::sites_path(), store::load_keys(store::ACCOUNT))
+        Self { fetch_icons: true, ..Self::start(store::sites_path(), store::load_keys(store::ACCOUNT)) }
     }
 
     fn start(sites_path: PathBuf, keys: Result<Option<Keys>, String>) -> Self {
@@ -173,6 +185,9 @@ impl App {
             search: String::new(),
             focus_search: true,
             selected: None,
+            icons: HashMap::new(),
+            names: HashMap::new(),
+            fetch_icons: false,
             show_password: false,
             clipboard: None,
             copied_at: None,
@@ -439,11 +454,14 @@ impl App {
                 let mut clicked = None;
                 let mut shown = 0;
                 for (i, site) in self.sites.sites.iter().enumerate() {
-                    if !site.site.contains(&query) && !site.login.contains(&query) {
+                    let in_note = site.note.to_lowercase().contains(&query);
+                    if !site.site.contains(&query) && !site.login.contains(&query) && !in_note {
                         continue;
                     }
                     shown += 1;
-                    if site_row(ui, site, self.selected == Some(i)).clicked() {
+                    let icon = if self.fetch_icons { site_icon(&mut self.icons, ui.ctx(), &site.site) } else { None };
+                    let name = display_name(&mut self.names, self.fetch_icons, ui.ctx(), &site.site);
+                    if site_row(ui, site, &name, icon, self.selected == Some(i)).clicked() {
                         clicked = Some(i);
                     }
                 }
@@ -479,10 +497,15 @@ impl App {
         theme::card().show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
+                let name = display_name(&mut self.names, self.fetch_icons, ui.ctx(), &site.site);
+                let subtitle = site_subtitle(&name, &site);
                 ui.vertical(|ui| {
-                    ui.label(RichText::new(&site.site).strong().size(16.0));
-                    if !site.login.is_empty() {
-                        ui.label(theme::small(&site.login));
+                    ui.label(RichText::new(&name).strong().size(16.0));
+                    if !subtitle.is_empty() {
+                        ui.label(theme::small(&subtitle));
+                    }
+                    if !site.note.is_empty() {
+                        ui.label(&site.note);
                     }
                 });
                 ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
@@ -574,6 +597,9 @@ impl App {
             }
             theme::field(ui, "Login (optional)", |ui| {
                 ui.add(theme::text_field(&mut editor.login).hint_text("username or email"))
+            });
+            theme::field(ui, "Note (optional)", |ui| {
+                ui.add(theme::text_field(&mut editor.note).hint_text("username: bassam_m"))
             });
         });
 
@@ -944,9 +970,53 @@ fn header(ui: &mut Ui, title: &str) -> bool {
     back
 }
 
-fn site_row(ui: &mut Ui, site: &Site, selected: bool) -> egui::Response {
+/// The site's favicon texture, loaded once; asks for it in the background the first time.
+fn site_icon<'a>(
+    icons: &'a mut HashMap<String, Option<(egui::TextureHandle, egui::Color32)>>,
+    ctx: &egui::Context,
+    site: &str,
+) -> Option<&'a (egui::TextureHandle, egui::Color32)> {
+    if !icons.contains_key(site) {
+        let repaint = ctx.clone();
+        let image = store::favicon(site, move || repaint.request_repaint())?;
+        let texture = image.map(|image| {
+            let tile = theme::tile_color(&image);
+            (ctx.load_texture(format!("icon:{site}"), image, egui::TextureOptions::LINEAR), tile)
+        });
+        icons.insert(site.to_owned(), texture);
+    }
+    icons[site].as_ref()
+}
+
+/// The name to show for a site: the one it gives itself ("GitHub"), else the stored name, title
+/// cased when it isn't an address ("My Bank"). Display only; passwords use the stored name.
+fn display_name(names: &mut HashMap<String, Option<String>>, fetch: bool, ctx: &egui::Context, site: &str) -> String {
+    if fetch && !names.contains_key(site) {
+        let repaint = ctx.clone();
+        if let Some(name) = store::site_name(site, move || repaint.request_repaint()) {
+            names.insert(site.to_owned(), name);
+        }
+    }
+    names.get(site).cloned().flatten().unwrap_or_else(|| store::title_case(site))
+}
+
+/// The stored name under a nicer `name` when they differ, then the login: "github.com · bassam".
+fn site_subtitle(name: &str, site: &Site) -> String {
+    let stored = (!name.eq_ignore_ascii_case(&site.site)).then_some(site.site.as_str());
+    let login = (!site.login.is_empty()).then_some(site.login.as_str());
+    stored.into_iter().chain(login).collect::<Vec<_>>().join(" · ")
+}
+
+fn site_row(
+    ui: &mut Ui,
+    site: &Site,
+    name: &str,
+    icon: Option<&(egui::TextureHandle, egui::Color32)>,
+    selected: bool,
+) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 52.0), Sense::click());
-    let label = if site.login.is_empty() { site.site.clone() } else { format!("{}, {}", site.site, site.login) };
+    let subtitle = site_subtitle(name, site);
+    let label = if subtitle.is_empty() { name.to_owned() } else { format!("{name}, {subtitle}") };
     response.widget_info(|| {
         egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, selected, &label)
     });
@@ -964,16 +1034,22 @@ fn site_row(ui: &mut Ui, site: &Site, selected: bool) -> egui::Response {
 
     let avatar = egui::pos2(rect.left() + 30.0, rect.center().y);
     let tile = egui::Rect::from_center_size(avatar, egui::Vec2::splat(36.0));
-    painter.rect_filled(tile, 11, theme::ACCENT.gamma_multiply(0.16));
-    let initial = site.site.chars().next().unwrap_or('?').to_uppercase().to_string();
-    painter.text(avatar, egui::Align2::CENTER_CENTER, initial, egui::FontId::proportional(16.0), theme::ACCENT);
+    let wash = icon.map_or(theme::ACCENT.gamma_multiply(0.16), |(_, color)| *color);
+    painter.rect_filled(tile, 11, wash);
+    if let Some((icon, _)) = icon {
+        let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+        painter.image(icon.id(), tile.shrink(6.0), uv, egui::Color32::WHITE);
+    } else {
+        let initial = site.site.chars().next().unwrap_or('?').to_uppercase().to_string();
+        painter.text(avatar, egui::Align2::CENTER_CENTER, initial, egui::FontId::proportional(16.0), theme::ACCENT);
+    }
 
     let left = rect.left() + 60.0;
-    if site.login.is_empty() {
+    if subtitle.is_empty() {
         painter.text(
             egui::pos2(left, rect.center().y),
             egui::Align2::LEFT_CENTER,
-            &site.site,
+            name,
             egui::FontId::proportional(15.0),
             theme::TEXT,
         );
@@ -981,14 +1057,14 @@ fn site_row(ui: &mut Ui, site: &Site, selected: bool) -> egui::Response {
         painter.text(
             egui::pos2(left, rect.center().y - 9.0),
             egui::Align2::LEFT_CENTER,
-            &site.site,
+            name,
             egui::FontId::proportional(15.0),
             theme::TEXT,
         );
         painter.text(
             egui::pos2(left, rect.center().y + 10.0),
             egui::Align2::LEFT_CENTER,
-            &site.login,
+            &subtitle,
             egui::FontId::proportional(13.0),
             theme::MUTED,
         );

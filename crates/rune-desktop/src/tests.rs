@@ -44,6 +44,7 @@ fn site(name: &str, login: &str) -> Site {
         classes: "luds".into(),
         symbols: DEFAULT_SYMBOLS.into(),
         apps: vec![],
+        note: String::new(),
     }
 }
 
@@ -218,7 +219,7 @@ fn screenshots() {
     let dir = temp_dir("shots");
     let sites = vec![
         site("bank.example", ""),
-        Site { counter: 2, ..site("github.com", "bassam") },
+        Site { counter: 2, note: "username: bassam_m".into(), ..site("github.com", "bassam") },
         site("github.com", "work"),
         site("mail.example", "bassam@example.com"),
         site("news.example", ""),
@@ -270,4 +271,56 @@ fn screenshots() {
         app.screen = Screen::Editor(editor);
         app.error = "Enter a site name.".into();
     });
+}
+
+/// Needs the internet: `cargo test -p rune-desktop -- --ignored favicon`.
+#[test]
+#[ignore]
+fn favicon() {
+    // Safety: ignored tests run on their own here; nothing else reads the environment meanwhile.
+    unsafe { std::env::set_var("XDG_CACHE_HOME", temp_dir("favicon")) };
+    assert_eq!(store::favicon("my bank", || {}).map(|i| i.is_some()), Some(false));
+
+    let (tx, rx) = mpsc::channel();
+    assert!(store::favicon("github.com", move || tx.send(()).unwrap()).is_none());
+    rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    let icon = store::favicon("github.com", || {}).unwrap().unwrap();
+    assert!(icon.size[0] > 0 && icon.size[0] <= 72);
+}
+
+#[test]
+fn tile_color() {
+    let clear = egui::Color32::TRANSPARENT;
+    // A 4×4 logo: `edge` all round, `middle` in the 2×2 centre.
+    let logo = |edge: egui::Color32, middle: egui::Color32| egui::ColorImage::new(
+        [4, 4],
+        (0..16).map(|i| if (1..=2).contains(&(i % 4)) && (1..=2).contains(&(i / 4)) { middle } else { edge }).collect(),
+    );
+
+    assert_eq!(theme::tile_color(&logo(egui::Color32::WHITE, egui::Color32::BLACK)), egui::Color32::WHITE);
+    assert_eq!(theme::tile_color(&logo(clear, egui::Color32::from_rgb(0x18, 0x17, 0x17))), theme::TEXT);
+    assert_eq!(
+        theme::tile_color(&logo(clear, egui::Color32::from_rgb(0x33, 0xCC, 0x66))),
+        egui::Color32::from_rgba_unmultiplied(0x33, 0xCC, 0x66, 0x29)
+    );
+    assert_eq!(theme::tile_color(&logo(clear, clear)), theme::TEXT);
+}
+
+#[test]
+fn site_title() {
+    use store::site_title;
+    assert_eq!(
+        site_title(r#"<title>GitHub · Build and ship software</title><meta property="og:site_name" content="GitHub">"#).as_deref(),
+        Some("GitHub")
+    );
+    assert_eq!(site_title(r#"<META content="Mom's Shop" name="application-name" />"#).as_deref(), Some("Mom's Shop"));
+    assert_eq!(site_title("<title>\n  Stack Overflow - Where Developers Learn\n</title>").as_deref(), Some("Stack Overflow"));
+    assert_eq!(site_title("<title>AT&amp;T | Official Site</title>").as_deref(), Some("AT&T"));
+    assert_eq!(site_title("<title>Amazon.com. Spend less. Smile more.</title>").as_deref(), Some("Amazon.com"));
+    assert_eq!(site_title("<title>Caf&#233; &eacute;t&eacute; ☕</title>").as_deref(), Some("Café &eacute;t&eacute; ☕"));
+    assert_eq!(site_title("<html><body>hi</body></html>"), None);
+    assert_eq!(site_title("<title>Just a moment...</title>"), None);
+    assert_eq!(site_title(&format!("<title>{}</title>", "x".repeat(60))), None);
+    assert_eq!(store::title_case("my bank"), "My Bank");
+    assert_eq!(store::title_case("github.com"), "github.com");
 }

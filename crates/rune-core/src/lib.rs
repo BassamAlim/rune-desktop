@@ -177,6 +177,10 @@ pub struct Site {
     /// Android package names linked to this site; carried through untouched on desktop.
     #[serde(default)]
     pub apps: Vec<String>,
+    /// Free text kept with the login, e.g. the username when the login is an email. Not secret,
+    /// not part of the password; absent in files written before it existed.
+    #[serde(default)]
+    pub note: String,
 }
 
 fn default_symbols() -> String {
@@ -302,10 +306,14 @@ mod tests {
             sites: vec![Site {
                 site: "github.com".into(), login: "bassam".into(), counter: 2,
                 length: 20, classes: "luds".into(), symbols: "-_".into(), apps: vec!["com.github.android".into()],
+                note: "username: bassam_m".into(),
             }],
         };
         list.save(&path).unwrap();
         assert_eq!(SiteList::load(&path).unwrap(), list);
+        // Files from before notes existed still load.
+        std::fs::write(&path, r#"{"version":1,"sites":[{"site":"a","counter":1,"length":16,"classes":"l"}]}"#).unwrap();
+        assert_eq!(SiteList::load(&path).unwrap().sites[0].note, "");
         std::fs::write(&path, "{ not json").unwrap();
         assert!(SiteList::load(&path).is_err());
         std::fs::remove_dir_all(dir).unwrap();
@@ -316,6 +324,7 @@ mod tests {
         let site = |name: &str, counter| Site {
             site: name.into(), login: String::new(), counter,
             length: 20, classes: "luds".into(), symbols: DEFAULT_SYMBOLS.into(), apps: vec![],
+            note: String::new(),
         };
         let mut mine = SiteList { version: 1, sites: vec![site("a", 3), site("b", 1)] };
         let counts = mine.merge(SiteList { version: 1, sites: vec![site("a", 2), site(" B", 2), site("c", 1)] });
