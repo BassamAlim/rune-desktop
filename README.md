@@ -10,6 +10,10 @@
 </p>
 
 <p align="center">
+  Pairs with <a href="https://github.com/BassamAlim/rune-android"><b>Rune for Android</b></a>: the same passwords on your phone, synced over Wi-Fi.
+</p>
+
+<p align="center">
   <a href="https://github.com/BassamAlim/rune-desktop/actions/workflows/ci.yml"><img src="https://github.com/BassamAlim/rune-desktop/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-GPL--3.0-blue.svg" alt="License: GPL-3.0" /></a>
   <img src="https://img.shields.io/badge/tested%20on-KDE%20Plasma%20(Wayland)-informational.svg" alt="Tested on KDE Plasma (Wayland)" />
