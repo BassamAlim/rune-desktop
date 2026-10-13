@@ -25,8 +25,15 @@ shared test data.
 
 ## How it works
 
-```
-master password ──Argon2id──▶ master key ──HMAC-SHA256(site, login, counter)──▶ site key ──▶ password
+```mermaid
+flowchart LR
+    mp([Master password]) -->|Argon2id| mk[Master key]
+    mk --> h{{HMAC-SHA256}}
+    s([Site, login, counter]) --> h
+    h --> sk[Site key]
+    sk --> g{{Pick characters}}
+    p([Length and allowed characters]) --> g
+    g --> pw([Password])
 ```
 
 There is no vault to sync, back up or leak: the same master password and site name give the
