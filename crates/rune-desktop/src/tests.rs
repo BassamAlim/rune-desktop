@@ -13,8 +13,11 @@ fn temp_dir(name: &str) -> PathBuf {
     dir
 }
 
+/// Set up, and past the lock screen.
 fn app_with_keys(sites_path: PathBuf) -> App {
-    App::start(sites_path, Ok(Some(Stored::from_master(&MASTER))))
+    let mut app = App::start(sites_path, Ok(Some(Stored::from_master(&MASTER))));
+    app.screen = Screen::Sites;
+    app
 }
 
 /// Answers what the app is asking as the phone would, for a phone holding `MASTER`.
@@ -240,8 +243,8 @@ fn the_master_password_answers_without_the_phone() {
     let mut app = App::start(temp_dir("fallback").join("sites.json"), Ok(Some(Stored::from_master(&master))));
     app.sites.sites = vec![site("github.com", "")];
     app.selected = Some(0);
+    app.screen = Screen::Sites;
     let mut harness = harness(app, Harness::builder());
-    assert!(matches!(harness.state().screen, Screen::Sites), "no lock: the list holds no secrets");
 
     // Not listening for the phone (as in tests), so the master password is asked for at once.
     click(&mut harness, "Show password");
@@ -258,8 +261,68 @@ fn the_master_password_answers_without_the_phone() {
     assert!(harness.state().asking.is_none());
 }
 
+/// Steps until the lock screen's master password is checked.
+fn wait_for_unlock(harness: &mut Harness<'_, App>) {
+    for _ in 0..200 {
+        if !matches!(&harness.state().screen, Screen::Locked(lock) if lock.deriving.is_some()) {
+            harness.run();
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        harness.step();
+    }
+    panic!("deriving took over 10 s");
+}
+
 #[test]
-fn forgets_what_was_revealed() {
+fn opens_locked_and_takes_the_master_password() {
+    let master = master_key("correct horse");
+    let mut app = App::start(temp_dir("locked").join("sites.json"), Ok(Some(Stored::from_master(&master))));
+    app.sites.sites = vec![site("github.com", "")];
+    let mut harness = harness(app, Harness::builder());
+    assert!(matches!(harness.state().screen, Screen::Locked(_)));
+    assert!(harness.query_by_label("github.com").is_none(), "the list is hidden");
+
+    // Not online in tests, so the sensor is never asked and the master password is offered.
+    for (typed, unlocked) in [("wrong horse", false), ("correct horse", true)] {
+        harness.get_by_role(Role::PasswordInput).type_text(typed);
+        harness.run();
+        harness.get_by_label_contains("Unlock").click();
+        harness.step();
+        wait_for_unlock(&mut harness);
+        assert_eq!(matches!(harness.state().screen, Screen::Sites), unlocked, "{typed}");
+    }
+    harness.get_by_label("github.com");
+}
+
+#[test]
+fn a_finger_unlocks_and_another_doesnt() {
+    let mut app = App::start(temp_dir("finger").join("sites.json"), Ok(Some(Stored::from_master(&MASTER))));
+    // Online only so the lock screen waits for the sensor; the sync listener stays off.
+    app.online = true;
+    app.sync_error = Some("off in tests".into());
+    let (tx, result) = mpsc::channel();
+    app.screen = Screen::Locked(Lock { check: Some(store::FingerCheck { result, child: None }), ..Default::default() });
+    let mut harness = harness(app, Harness::builder());
+    harness.get_by_label_contains("Touch the fingerprint sensor");
+
+    tx.send(Some(false)).unwrap();
+    harness.run();
+    harness.get_by_label_contains("That finger didn't match.");
+    assert!(matches!(harness.state().screen, Screen::Locked(_)));
+
+    let (tx, result) = mpsc::channel();
+    if let Screen::Locked(lock) = &mut harness.state_mut().screen {
+        lock.check = Some(store::FingerCheck { result, child: None });
+        lock.failed = None;
+    }
+    tx.send(Some(true)).unwrap();
+    harness.run();
+    assert!(matches!(harness.state().screen, Screen::Sites));
+}
+
+#[test]
+fn locks_when_idle_forgetting_what_was_revealed() {
     let mut app = app_with_keys(temp_dir("forget").join("sites.json"));
     app.sites.sites = vec![site("github.com", ""), site("b.example", "")];
     app.select(Some(0));
@@ -267,18 +330,25 @@ fn forgets_what_was_revealed() {
     answer(&mut app);
     app.show_password = true;
     let ctx = egui::Context::default();
-    app.forget_when_idle(&ctx);
+    app.lock_when_idle(&ctx);
     assert!(app.revealed.is_some(), "not idle yet");
     app.select(Some(0));
     assert!(app.revealed.is_some(), "re-selecting the same site keeps it");
-    app.active_at = SystemTime::now() - FORGET_AFTER;
-    app.forget_when_idle(&ctx);
-    assert!(app.revealed.is_none() && !app.show_password);
-
-    app.ask(Purpose::Show { site: "github.com".into(), login: "".into() });
-    answer(&mut app);
     app.select(Some(1));
     assert!(app.revealed.is_none(), "another site forgets it");
+
+    app.select(Some(0));
+    app.ask(Purpose::Show { site: "github.com".into(), login: "".into() });
+    answer(&mut app);
+    app.active_at = SystemTime::now() - LOCK_AFTER;
+    app.lock_when_idle(&ctx);
+    assert!(app.revealed.is_none() && !app.show_password);
+    assert!(matches!(app.screen, Screen::Locked(_)));
+
+    let mut harness = harness(app_with_keys(temp_dir("lock-button").join("sites.json")), Harness::builder());
+    harness.get_by_label("Lock").click();
+    harness.run();
+    assert!(matches!(harness.state().screen, Screen::Locked(_)));
 }
 
 #[test]
@@ -604,6 +674,9 @@ fn screenshots() {
         harness.render().unwrap().save(out.join(format!("{name}.png"))).unwrap();
     };
 
+    shoot("0-locked", &|app| {
+        app.screen = Screen::Locked(Lock { typed: Some(Zeroizing::default()), failed: Some("That finger didn't match.".into()), ..Default::default() });
+    });
     shoot("4c-asking", &|app| {
         app.sites.sites = sites.clone();
         app.select(Some(1));

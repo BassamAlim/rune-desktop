@@ -65,7 +65,8 @@ cargo test -p rune-desktop -- --ignored clipboard     # overwrites the clipboard
 ## Where things are kept
 
 - Keys: the Secret Service keyring (KWallet), service `rune`, account `keys`: the sync key and
-  fingerprint only, never the master key. Revealed passwords are forgotten after 5 idle minutes.
+  fingerprint only, never the master key. Rune opens behind your fingerprint (or master
+  password) and locks after 5 idle minutes; that hides the list on screen, nothing more.
 - Site list: `~/.local/share/rune/sites.json`. It holds names and settings, never passwords.
 
 ## Changing the algorithm

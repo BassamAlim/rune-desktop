@@ -90,6 +90,65 @@ pub fn delete_keys(account: &str) -> Result<(), String> {
     }
 }
 
+/// A finger on the sensor, checked by fprintd. It only hides the window's contents: nothing
+/// secret is released by a match (SPEC §5).
+pub struct FingerCheck {
+    /// `Some(true)` a match, `Some(false)` another finger, `None` when fprintd can't check
+    /// (no sensor, no enrolled finger, not installed).
+    pub result: Receiver<Option<bool>>,
+    pub(crate) child: Option<std::process::Child>,
+}
+
+impl Drop for FingerCheck {
+    fn drop(&mut self) {
+        if let Some(child) = &mut self.child {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+/// Waits for one finger on the sensor; `done` runs when there's an answer.
+pub fn check_finger(done: impl FnOnce() + Send + 'static) -> FingerCheck {
+    use std::io::BufRead;
+    let (tx, result) = mpsc::channel();
+    let child = std::process::Command::new("fprintd-verify")
+        .env("LC_ALL", "C")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+    let mut child = match child {
+        Ok(child) => child,
+        Err(_) => {
+            let _ = tx.send(None);
+            done();
+            return FingerCheck { result, child: None };
+        }
+    };
+    let stdout = child.stdout.take().expect("piped");
+    std::thread::spawn(move || {
+        // "Verify result: verify-match (done)" is fprintd's own constant, never translated.
+        let mut answer = None;
+        for line in std::io::BufReader::new(stdout).lines().map_while(Result::ok) {
+            if let Some(found) = line.strip_prefix("Verify result: ") {
+                answer = match found.split(' ').next() {
+                    Some("verify-match") => Some(true),
+                    Some("verify-no-match") => Some(false),
+                    // Retry prompts aren't done; anything else done means the sensor failed.
+                    _ => None,
+                };
+                if found.contains("(done)") {
+                    break;
+                }
+            }
+        }
+        let _ = tx.send(answer);
+        done();
+    });
+    FingerCheck { result, child: Some(child) }
+}
+
 /// UDP for being found, TCP for the exchange (SPEC §3.3). Android's `Wire.PORT` is the same.
 pub const SYNC_PORT: u16 = 47825;
 const SYNC_PROBE: &str = "rune-sync/1";

@@ -21,8 +21,8 @@ use zeroize::{Zeroize, Zeroizing};
 /// Content never gets wider than this; on a wide window it is centred.
 const CONTENT_WIDTH: f32 = 520.0;
 const COPIED_FLASH: Duration = Duration::from_secs(2);
-/// Idle this long and the passwords the phone revealed are forgotten.
-const FORGET_AFTER: Duration = Duration::from_secs(5 * 60);
+/// Idle this long and Rune locks, forgetting what the phone revealed.
+const LOCK_AFTER: Duration = Duration::from_secs(5 * 60);
 
 struct Editor {
     /// Index in the site list when editing; `None` when adding.
@@ -181,8 +181,21 @@ struct Asking {
     deriving: Option<Receiver<Keys>>,
 }
 
+/// The list hidden behind a finger, or the master password. It hides only: a match opens
+/// nothing secret (SPEC §5).
+#[derive(Default)]
+struct Lock {
+    check: Option<store::FingerCheck>,
+    /// Why the last try didn't unlock.
+    failed: Option<String>,
+    /// The master password, typed instead of a finger.
+    typed: Option<Zeroizing<String>>,
+    deriving: Option<Receiver<Keys>>,
+}
+
 enum Screen {
     Setup,
+    Locked(Lock),
     Deriving { rx: Receiver<Keys> },
     Confirm { keys: Keys },
     Sites,
@@ -285,7 +298,7 @@ impl App {
         match stored {
             Ok(Some(stored)) => {
                 app.stored = Some(stored);
-                app.screen = Screen::Sites;
+                app.screen = Screen::Locked(Lock::default());
             }
             Ok(None) => {}
             Err(e) => app.error = format!("Can't reach the system keyring: {e}"),
@@ -398,20 +411,136 @@ impl App {
         Some(Screen::Deriving { rx: derive(password, ui.ctx().clone()) })
     }
 
-    /// Forgets what the phone revealed once idle for [`FORGET_AFTER`]. Runs in `logic`, which
-    /// eframe calls even while the window is minimised.
-    fn forget_when_idle(&mut self, ctx: &egui::Context) {
-        if self.revealed.is_none() {
+    /// Locks once idle for [`LOCK_AFTER`]. Runs in `logic`, which eframe calls even while the
+    /// window is minimised.
+    fn lock_when_idle(&mut self, ctx: &egui::Context) {
+        if !matches!(self.screen, Screen::Sites | Screen::Editor(_) | Screen::Settings(_)) {
             return;
         }
         let idle = self.active_at.elapsed().unwrap_or_default();
-        match FORGET_AFTER.checked_sub(idle) {
+        match LOCK_AFTER.checked_sub(idle) {
             Some(left) if !left.is_zero() => ctx.request_repaint_after(left),
-            _ => {
-                self.revealed = None;
-                self.show_password = false;
+            _ => self.lock(),
+        }
+    }
+
+    /// Hides the list and forgets whatever was revealed or being asked. Sync carries on.
+    fn lock(&mut self) {
+        self.revealed = None;
+        self.asking = None;
+        self.show_password = false;
+        self.confirm_switch = false;
+        if let Some(mut typed) = self.keeping.take() {
+            typed.zeroize();
+        }
+        self.error.clear();
+        self.screen = Screen::Locked(Lock::default());
+    }
+
+    fn locked_screen(&mut self, ui: &mut Ui) -> Option<Screen> {
+        let fingerprint_stored = self.stored.as_ref().map(|s| s.fingerprint.clone());
+        let online = self.online;
+        let mark = self.mark(ui, 64.0);
+        let Screen::Locked(lock) = &mut self.screen else {
+            return None;
+        };
+        let mut unlocked = false;
+
+        if let Some(check) = &lock.check
+            && let Ok(result) = check.result.try_recv()
+        {
+            lock.check = None;
+            match result {
+                Some(true) => unlocked = true,
+                Some(false) => lock.failed = Some("That finger didn't match.".into()),
+                None => {
+                    lock.failed = Some("The fingerprint sensor isn't available.".into());
+                    lock.typed = Some(Zeroizing::default());
+                }
             }
         }
+        if let Some(rx) = &lock.deriving
+            && let Ok(keys) = rx.try_recv()
+        {
+            lock.deriving = None;
+            // Only checked, never kept: the master key goes with `keys`.
+            if fingerprint_stored == Some(fingerprint(&keys.master)) {
+                unlocked = true;
+            } else {
+                lock.failed = Some("That isn't your master password.".into());
+            }
+        }
+        // Tests never touch the real sensor.
+        if !online && lock.typed.is_none() {
+            lock.typed = Some(Zeroizing::default());
+        }
+        if lock.check.is_none() && lock.failed.is_none() && lock.typed.is_none() && !unlocked {
+            let ctx = ui.ctx().clone();
+            lock.check = Some(store::check_finger(move || ctx.request_repaint()));
+        }
+
+        ui.add_space(ui.available_height() * 0.2);
+        ui.vertical_centered(|ui| {
+            ui.add(mark);
+            ui.add_space(4.0);
+            ui.heading("Rune is locked");
+        });
+        ui.add_space(16.0);
+
+        if let Some(typed) = &mut lock.typed {
+            let field = theme::field(ui, "Master password", |ui| {
+                theme::password_field(ui, &mut *typed, &mut self.show_master)
+            });
+            if ui.memory(|m| m.focused().is_none()) {
+                field.request_focus();
+            }
+            if let Some(failed) = &lock.failed {
+                ui.add(egui::Label::new(theme::icon_text(icon::WARNING, failed, theme::DANGER, 15.0)).wrap());
+            }
+            ui.add_space(8.0);
+            if lock.deriving.is_some() {
+                ui.vertical_centered(|ui| ui.spinner());
+            } else {
+                let submit = ui.add_sized([ui.available_width(), 40.0], theme::primary_button(icon::LOCK_OPEN, "Unlock")).clicked()
+                    || ui.input(|i| i.key_pressed(Key::Enter));
+                if submit && !typed.is_empty() {
+                    lock.deriving = Some(derive(std::mem::take(&mut **typed), ui.ctx().clone()));
+                    lock.failed = None;
+                }
+            }
+            if online && ui.button("Use fingerprint").clicked() {
+                lock.typed = None;
+                lock.failed = None;
+            }
+        } else {
+            ui.vertical_centered(|ui| {
+                match &lock.failed {
+                    None => {
+                        ui.add(egui::Label::new(theme::icon_text(icon::FINGERPRINT, "Touch the fingerprint sensor", theme::ACCENT, 18.0)));
+                    }
+                    Some(failed) => {
+                        ui.add(egui::Label::new(theme::icon_text(icon::WARNING, failed, theme::DANGER, 15.0)).wrap());
+                        ui.add_space(8.0);
+                        if ui.add(theme::primary_button(icon::FINGERPRINT, "Try again")).clicked() {
+                            lock.failed = None;
+                        }
+                    }
+                }
+                ui.add_space(8.0);
+                if ui.button("Use master password").clicked() {
+                    lock.check = None;
+                    lock.failed = None;
+                    lock.typed = Some(Zeroizing::default());
+                }
+            });
+        }
+
+        if !unlocked {
+            return None;
+        }
+        self.show_master = false;
+        self.active_at = SystemTime::now();
+        Some(self.go_to_sites())
     }
 
     fn confirm_screen(&mut self, ui: &mut Ui) -> Option<Screen> {
@@ -498,6 +627,7 @@ impl App {
 
     fn sites_screen(&mut self, ui: &mut Ui) -> Option<Screen> {
         let mut next = None;
+        let mut lock = false;
         ui.horizontal(|ui| {
             ui.add(self.mark(ui, 30.0));
             ui.heading("rune");
@@ -505,8 +635,13 @@ impl App {
                 if theme::icon_button(ui, icon::GEAR, "Settings").clicked() {
                     next = Some(Screen::Settings(Settings::default()));
                 }
+                lock = theme::icon_button(ui, icon::LOCK, "Lock").clicked();
             });
         });
+        if lock {
+            self.lock();
+            return None;
+        }
         ui.add_space(4.0);
 
         if self.sites.sites.is_empty() {
@@ -853,7 +988,7 @@ impl App {
                     });
                     return;
                 }
-                let field = theme::field(ui, "Master password", |ui| ui.add(theme::text_field(&mut *typed).password(true)));
+                let field = theme::field(ui, "Master password", |ui| theme::password_field(ui, &mut *typed, &mut self.show_master));
                 if asking.request.is_none() && ui.memory(|m| m.focused().is_none()) {
                     field.request_focus();
                 }
@@ -1357,6 +1492,7 @@ impl App {
         let next = egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
             let next = match &self.screen {
                 Screen::Setup => self.setup_screen(ui),
+                Screen::Locked(_) => self.locked_screen(ui),
                 Screen::Deriving { rx } => {
                     let received = rx.try_recv().ok();
                     ui.add_space(ui.available_height() * 0.35);
@@ -1587,8 +1723,15 @@ fn open_dialog(kind: Dialog, ctx: egui::Context) -> Receiver<Option<PathBuf>> {
 }
 
 impl eframe::App for App {
+    /// A finger check left waiting would keep the sensor from sudo and the lock screen.
+    fn on_exit(&mut self) {
+        if let Screen::Locked(lock) = &mut self.screen {
+            lock.check = None;
+        }
+    }
+
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.forget_when_idle(ctx);
+        self.lock_when_idle(ctx);
     }
 
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
