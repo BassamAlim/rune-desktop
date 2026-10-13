@@ -60,8 +60,8 @@ cargo test -p rune-desktop -- --ignored clipboard     # overwrites the clipboard
 
 ## Where things are kept
 
-- Keys: the Secret Service keyring (KWallet), service `rune`, account `keys`. Anyone at your
-  unlocked desktop session can open Rune; the keyring is the lock.
+- Keys: the Secret Service keyring (KWallet), service `rune`, account `keys`: the sync key and
+  fingerprint only. The master password is asked at each launch and after 5 idle minutes.
 - Site list: `~/.local/share/rune/sites.json`. It holds names and settings, never passwords.
 
 ## Changing the algorithm

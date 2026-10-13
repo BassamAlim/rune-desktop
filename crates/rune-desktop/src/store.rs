@@ -28,28 +28,59 @@ impl Drop for Keys {
     }
 }
 
-/// Stored as one 32-byte keyring secret: the master key.
-pub fn load_keys(account: &str) -> Result<Option<Keys>, String> {
+/// What stays on this computer between unlocks (SPEC §5): never the master key. The sync key
+/// lets the phone sync while Rune is locked (§3.3); the fingerprint catches a mistyped master
+/// password at unlock.
+pub struct Stored {
+    pub sync: Key,
+    pub fingerprint: String,
+}
+
+impl Stored {
+    pub fn from_master(master: &Key) -> Self {
+        Self { sync: rune_core::sync_key(master), fingerprint: rune_core::fingerprint(master) }
+    }
+}
+
+impl Drop for Stored {
+    fn drop(&mut self) {
+        self.sync.zeroize();
+    }
+}
+
+/// Stored as one keyring secret: sync key ‖ fingerprint.
+pub fn load_keys(account: &str) -> Result<Option<Stored>, String> {
     let entry = keyring::Entry::new(SERVICE, account).map_err(|e| e.to_string())?;
     match entry.get_secret() {
         Ok(mut bytes) => {
-            let keys = match <[u8; 32]>::try_from(bytes.as_slice()) {
-                Ok(master) => Ok(Some(Keys { master })),
+            let stored = match bytes.len() {
+                36 => Ok(Some(Stored {
+                    sync: bytes[..32].try_into().expect("32 bytes"),
+                    fingerprint: String::from_utf8_lossy(&bytes[32..]).into_owned(),
+                })),
+                // The master key itself, from before Rune locked: keep only what it needs now.
+                32 => {
+                    let stored = Stored::from_master(bytes[..].try_into().expect("32 bytes"));
+                    save_keys(account, &stored).map(|()| Some(stored))
+                }
                 // 64 bytes is the older secret key ‖ master key layout.
-                Err(_) => Err("the stored keys are from an older Rune; set it up again".to_string()),
+                _ => Err("the stored keys are from an older Rune; set it up again".to_string()),
             };
             bytes.zeroize();
-            keys
+            stored
         }
         Err(keyring::Error::NoEntry) => Ok(None),
         Err(e) => Err(e.to_string()),
     }
 }
 
-pub fn save_keys(account: &str, keys: &Keys) -> Result<(), String> {
-    keyring::Entry::new(SERVICE, account)
-        .and_then(|entry| entry.set_secret(&keys.master))
-        .map_err(|e| e.to_string())
+pub fn save_keys(account: &str, stored: &Stored) -> Result<(), String> {
+    let mut bytes = [&stored.sync[..], stored.fingerprint.as_bytes()].concat();
+    let result = keyring::Entry::new(SERVICE, account)
+        .and_then(|entry| entry.set_secret(&bytes))
+        .map_err(|e| e.to_string());
+    bytes.zeroize();
+    result
 }
 
 pub fn delete_keys(account: &str) -> Result<(), String> {
@@ -415,10 +446,13 @@ mod tests {
     #[ignore = "writes to the real session keyring"]
     fn keyring_roundtrip() {
         let account = "test";
-        let keys = Keys { master: [2; 32] };
-        save_keys(account, &keys).unwrap();
+        save_keys(account, &Stored::from_master(&[2; 32])).unwrap();
         let loaded = load_keys(account).unwrap().unwrap();
-        assert_eq!(loaded.master, keys.master);
+        assert_eq!((loaded.sync, loaded.fingerprint.as_str()), (rune_core::sync_key(&[2; 32]), rune_core::fingerprint(&[2; 32]).as_str()));
+        // A master key left by an older Rune turns into the same, and is gone from the keyring.
+        keyring::Entry::new(SERVICE, account).unwrap().set_secret(&[2; 32]).unwrap();
+        assert_eq!(load_keys(account).unwrap().unwrap().sync, loaded.sync);
+        assert_eq!(keyring::Entry::new(SERVICE, account).unwrap().get_secret().unwrap().len(), 36);
         delete_keys(account).unwrap();
         assert!(load_keys(account).unwrap().is_none());
         delete_keys(account).unwrap(); // deleting twice is fine

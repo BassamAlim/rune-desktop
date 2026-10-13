@@ -5,7 +5,7 @@ mod theme;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use arboard::Clipboard;
 use rune_core::{
@@ -13,13 +13,15 @@ use rune_core::{
     normalize, open, password, seal, seal_key, site_key,
 };
 use eframe::egui::{self, Align, Key, Layout, RichText, Sense, Ui};
-use store::Keys;
+use store::{Keys, Stored};
 use theme::icon;
 use zeroize::Zeroize;
 
 /// Content never gets wider than this; on a wide window it is centred.
 const CONTENT_WIDTH: f32 = 520.0;
 const COPIED_FLASH: Duration = Duration::from_secs(2);
+/// Idle this long and the master key is forgotten until the master password is typed again.
+const LOCK_AFTER: Duration = Duration::from_secs(5 * 60);
 
 struct Editor {
     /// Index in the site list when editing; `None` when adding.
@@ -140,7 +142,9 @@ struct Settings {
 
 enum Screen {
     Setup,
-    Deriving { rx: Receiver<Keys> },
+    Unlock,
+    /// `unlocking`: checked against the stored fingerprint, rather than shown for setup.
+    Deriving { rx: Receiver<Keys>, unlocking: bool },
     Confirm { keys: Keys },
     Sites,
     Editor(Editor),
@@ -160,8 +164,11 @@ struct App {
     confirm: String,
     show_master: bool,
 
-    // Set once setup is done
+    // Set once setup is done; `keys` only while unlocked.
+    stored: Option<Stored>,
     keys: Option<Keys>,
+    /// Wall-clock, so time asleep counts toward the lock.
+    active_at: SystemTime,
     sites: SiteList,
     sites_path: PathBuf,
 
@@ -196,7 +203,7 @@ impl App {
         Self { online: true, ..Self::start(store::sites_path(), store::load_keys(store::ACCOUNT)) }
     }
 
-    fn start(sites_path: PathBuf, keys: Result<Option<Keys>, String>) -> Self {
+    fn start(sites_path: PathBuf, stored: Result<Option<Stored>, String>) -> Self {
         let mut app = Self {
             screen: Screen::Setup,
             error: String::new(),
@@ -205,7 +212,9 @@ impl App {
             password: String::new(),
             confirm: String::new(),
             show_master: false,
+            stored: None,
             keys: None,
+            active_at: SystemTime::now(),
             sites: SiteList { version: 1, sites: vec![], deleted: vec![] },
             sites_path,
             search: String::new(),
@@ -231,10 +240,10 @@ impl App {
                 return app;
             }
         }
-        match keys {
-            Ok(Some(keys)) => {
-                app.keys = Some(keys);
-                app.screen = Screen::Sites;
+        match stored {
+            Ok(Some(stored)) => {
+                app.stored = Some(stored);
+                app.screen = Screen::Unlock;
             }
             Ok(None) => {}
             Err(e) => app.error = format!("Can't reach the system keyring: {e}"),
@@ -334,7 +343,7 @@ impl App {
             None if self.password != self.confirm => Err("The two passwords don't match."),
             None => Ok(std::mem::take(&mut self.password)),
         };
-        let mut password = match checked {
+        let password = match checked {
             Ok(password) => password,
             Err(e) => {
                 self.error = e.to_string();
@@ -344,16 +353,53 @@ impl App {
         self.error.clear();
         self.confirm.zeroize();
 
-        // Argon2id takes about a second; keep it off the UI thread.
-        let (tx, rx) = mpsc::channel();
-        let ctx = ui.ctx().clone();
-        std::thread::spawn(move || {
-            let master = master_key(&password);
-            password.zeroize();
-            let _ = tx.send(Keys { master });
-            ctx.request_repaint();
+        Some(Screen::Deriving { rx: derive(password, ui.ctx().clone()), unlocking: false })
+    }
+
+    fn unlock_screen(&mut self, ui: &mut Ui) -> Option<Screen> {
+        ui.add_space(ui.available_height() * 0.2);
+        ui.vertical_centered(|ui| {
+            ui.add(self.mark(ui, 64.0));
+            ui.add_space(4.0);
+            ui.heading("Unlock Rune");
         });
-        Some(Screen::Deriving { rx })
+        ui.add_space(16.0);
+        let field = theme::field(ui, "Master password", |ui| {
+            theme::password_field(ui, &mut self.password, &mut self.show_master)
+        });
+        if ui.memory(|m| m.focused().is_none()) {
+            field.request_focus();
+        }
+        ui.add_space(8.0);
+        let submit = ui.add_sized([ui.available_width(), 40.0], theme::primary_button(icon::LOCK_OPEN, "Unlock")).clicked()
+            || ui.input(|i| i.key_pressed(Key::Enter));
+        if !submit || self.password.is_empty() {
+            return None;
+        }
+        self.error.clear();
+        Some(Screen::Deriving { rx: derive(std::mem::take(&mut self.password), ui.ctx().clone()), unlocking: true })
+    }
+
+    /// Forgets the master key and everything shown with it; the site list and sync carry on.
+    fn lock(&mut self) {
+        self.keys = None;
+        self.select(None);
+        self.password.zeroize();
+        self.error.clear();
+        self.screen = Screen::Unlock;
+    }
+
+    /// Locks once idle for [`LOCK_AFTER`]. Runs in `logic`, which eframe calls even while the
+    /// window is minimised.
+    fn lock_when_idle(&mut self, ctx: &egui::Context) {
+        if self.keys.is_none() {
+            return;
+        }
+        let idle = self.active_at.elapsed().unwrap_or_default();
+        match LOCK_AFTER.checked_sub(idle) {
+            Some(left) if !left.is_zero() => ctx.request_repaint_after(left),
+            _ => self.lock(),
+        }
     }
 
     fn confirm_screen(&mut self, ui: &mut Ui) -> Option<Screen> {
@@ -380,8 +426,10 @@ impl App {
                 next = Some(Screen::Setup);
             }
             if ui.add(theme::primary_button("", "Save and continue")).clicked() {
-                match store::save_keys(store::ACCOUNT, keys) {
+                let stored = Stored::from_master(&keys.master);
+                match store::save_keys(store::ACCOUNT, &stored) {
                     Ok(()) => {
+                        self.stored = Some(stored);
                         self.keys = Some(Keys { ..*keys });
                         if let Some(mut phrase) = self.generated.take() {
                             phrase.zeroize();
@@ -429,6 +477,7 @@ impl App {
 
     fn sites_screen(&mut self, ui: &mut Ui) -> Option<Screen> {
         let mut next = None;
+        let mut lock = false;
         ui.horizontal(|ui| {
             ui.add(self.mark(ui, 30.0));
             ui.heading("rune");
@@ -436,8 +485,13 @@ impl App {
                 if theme::icon_button(ui, icon::GEAR, "Settings").clicked() {
                     next = Some(Screen::Settings(Settings::default()));
                 }
+                lock = theme::icon_button(ui, icon::LOCK, "Lock").clicked();
             });
         });
+        if lock {
+            self.lock();
+            return None;
+        }
         ui.add_space(4.0);
 
         if self.sites.sites.is_empty() {
@@ -963,7 +1017,7 @@ impl App {
         let Screen::Settings(settings) = &mut self.screen else {
             return None;
         };
-        let Some(keys) = &self.keys else {
+        let Some(stored) = &self.stored else {
             return Some(Screen::Setup);
         };
 
@@ -972,7 +1026,7 @@ impl App {
             ui.label(RichText::new("Your key").strong());
             ui.horizontal(|ui| {
                 ui.label(theme::muted("Fingerprint"));
-                ui.label(RichText::new(fingerprint(&keys.master)).monospace().color(theme::ACCENT));
+                ui.label(RichText::new(&stored.fingerprint).monospace().color(theme::ACCENT));
             });
             ui.label(theme::small(
                 "A new device needs only your master password; matching fingerprints show it was typed right.",
@@ -1016,7 +1070,7 @@ impl App {
             ui.label(RichText::new("Reset").strong());
             ui.label(theme::small(
                 "Removes your keys from this computer. Your site list stays. To use Rune again here \
-                 you need your master password.",
+                 you need your master password. Rune locks itself after 5 idle minutes.",
             ));
             ui.horizontal(|ui| {
                 if !settings.confirm_reset {
@@ -1027,6 +1081,7 @@ impl App {
                     if ui.add(theme::danger_button("", "Yes, remove my keys")).clicked() {
                         match store::delete_keys(store::ACCOUNT) {
                             Ok(()) => {
+                                self.stored = None;
                                 self.keys = None;
                                 next = Some(Screen::Setup);
                             }
@@ -1054,18 +1109,18 @@ impl App {
 
     // ---- Frame -------------------------------------------------------------------------------
 
-    /// Starts answering the phone once there are keys, and takes in what a sync changed.
+    /// Starts answering the phone once set up, locked or not, and takes in what a sync changed.
     fn sync_with_phone(&mut self, ctx: &egui::Context) {
         if !self.online {
             return;
         }
-        match &self.keys {
-            Some(keys) if self.sync.is_none() && self.sync_error.is_none() => {
+        match &self.stored {
+            Some(stored) if self.sync.is_none() && self.sync_error.is_none() => {
                 let wake = ctx.clone();
                 let listener = store::listen_for_sync(
                     store::SYNC_PORT,
-                    rune_core::sync_key(&keys.master),
-                    &fingerprint(&keys.master),
+                    stored.sync,
+                    &stored.fingerprint,
                     self.sites_path.clone(),
                     move || wake.request_repaint(),
                 );
@@ -1116,6 +1171,9 @@ impl App {
     }
 
     fn draw(&mut self, ui: &mut Ui) {
+        if ui.input(|i| !i.events.is_empty()) {
+            self.active_at = SystemTime::now();
+        }
         self.sync_with_phone(ui.ctx());
         let frame = egui::Frame::new().fill(theme::BG).inner_margin(egui::Margin::same(20));
         egui::CentralPanel::default().frame(frame).show(ui, |ui| {
@@ -1151,14 +1209,27 @@ impl App {
         let next = egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
             let next = match &self.screen {
                 Screen::Setup => self.setup_screen(ui),
-                Screen::Deriving { rx } => {
+                Screen::Unlock => self.unlock_screen(ui),
+                &Screen::Deriving { ref rx, unlocking } => {
                     let received = rx.try_recv().ok();
                     ui.add_space(ui.available_height() * 0.35);
                     ui.vertical_centered(|ui| {
                         ui.spinner();
-                        ui.label(theme::muted("Deriving your key…"));
+                        ui.label(theme::muted(if unlocking { "Unlocking…" } else { "Deriving your key…" }));
                     });
-                    received.map(|keys| Screen::Confirm { keys })
+                    match received {
+                        Some(keys) if !unlocking => Some(Screen::Confirm { keys }),
+                        Some(keys) if self.stored.as_ref().is_some_and(|s| s.fingerprint == fingerprint(&keys.master)) => {
+                            self.keys = Some(keys);
+                            self.active_at = SystemTime::now();
+                            Some(self.go_to_sites())
+                        }
+                        Some(_) => {
+                            self.error = "That isn't your master password.".to_string();
+                            Some(Screen::Unlock)
+                        }
+                        None => None,
+                    }
                 }
                 Screen::Confirm { .. } => self.confirm_screen(ui),
                 Screen::Sites => unreachable!("drawn above"),
@@ -1181,6 +1252,18 @@ impl App {
             self.screen = screen;
         }
     }
+}
+
+/// The master key from `password`, on its own thread: Argon2id takes about a second.
+fn derive(mut password: String, ctx: egui::Context) -> Receiver<Keys> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let master = master_key(&password);
+        password.zeroize();
+        let _ = tx.send(Keys { master });
+        ctx.request_repaint();
+    });
+    rx
 }
 
 /// Six fresh words from the OS's randomness.
@@ -1332,6 +1415,10 @@ fn open_dialog(kind: Dialog, ctx: egui::Context) -> Receiver<Option<PathBuf>> {
 }
 
 impl eframe::App for App {
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.lock_when_idle(ctx);
+    }
+
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         self.draw(ui);
     }

@@ -146,8 +146,18 @@ pub fn danger_button(glyph: &str, text: &str) -> egui::Button<'static> {
 
 /// A frameless icon-only button. `label` is its tooltip and accessible name.
 pub fn icon_button(ui: &mut Ui, icon: &str, label: &str) -> Response {
-    let button = egui::Button::new(glyph(icon).size(20.0)).frame_when_inactive(false);
-    let response = ui.add_sized([36.0, 36.0], button).on_hover_text(label);
+    // Always framed, invisibly when inactive: a frame that appears on hover brings its stroke
+    // width with it, which nudges whatever shares the row.
+    let response = ui
+        .scope(|ui| {
+            let inactive = &mut ui.visuals_mut().widgets.inactive;
+            inactive.bg_fill = Color32::TRANSPARENT;
+            inactive.weak_bg_fill = Color32::TRANSPARENT;
+            inactive.bg_stroke.color = Color32::TRANSPARENT;
+            ui.add_sized([36.0, 36.0], egui::Button::new(glyph(icon).size(20.0)))
+        })
+        .inner
+        .on_hover_text(label);
     response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label));
     response
 }

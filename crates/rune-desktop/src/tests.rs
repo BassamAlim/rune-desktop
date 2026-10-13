@@ -13,8 +13,12 @@ fn temp_dir(name: &str) -> PathBuf {
     dir
 }
 
+/// Set up and unlocked.
 fn app_with_keys(sites_path: PathBuf) -> App {
-    App::start(sites_path, Ok(Some(Keys { master: MASTER })))
+    let mut app = App::start(sites_path, Ok(Some(Stored::from_master(&MASTER))));
+    app.keys = Some(Keys { master: MASTER });
+    app.screen = Screen::Sites;
+    app
 }
 
 fn harness(app: App, builder: egui_kittest::HarnessBuilder<App>) -> Harness<'static, App> {
@@ -209,6 +213,64 @@ fn setup_checks_the_typed_back_words() {
     assert!(matches!(harness.state().screen, Screen::Deriving { .. }));
 }
 
+/// Steps until Argon2 is done: the spinner never lets the harness settle.
+fn wait_for_derive(harness: &mut Harness<'_, App>) {
+    for _ in 0..200 {
+        if !matches!(harness.state().screen, Screen::Deriving { .. }) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        harness.step();
+    }
+    panic!("deriving took over 10 s");
+}
+
+#[test]
+fn unlock_takes_only_the_master_password() {
+    let stored = Stored::from_master(&master_key("correct horse"));
+    let mut harness = harness(App::start(temp_dir("unlock").join("sites.json"), Ok(Some(stored))), Harness::builder());
+    assert!(matches!(harness.state().screen, Screen::Unlock));
+    assert!(harness.state().keys.is_none(), "the master key isn't stored");
+
+    harness.get_by_role(Role::PasswordInput).type_text("wrong horse");
+    harness.run();
+    button(&harness, "Unlock").click();
+    harness.step();
+    wait_for_derive(&mut harness);
+    assert!(matches!(harness.state().screen, Screen::Unlock));
+    assert_eq!(harness.state().error, "That isn't your master password.");
+    harness.run();
+    harness.get_by_role(Role::PasswordInput).type_text("correct horse");
+    harness.run();
+    button(&harness, "Unlock").click();
+    harness.step();
+    wait_for_derive(&mut harness);
+    assert!(matches!(harness.state().screen, Screen::Sites));
+    assert_eq!(harness.state().keys.as_ref().unwrap().master, master_key("correct horse"));
+    assert!(harness.state().error.is_empty());
+}
+
+#[test]
+fn locks_when_idle_or_asked() {
+    let mut app = app_with_keys(temp_dir("lock").join("sites.json"));
+    app.sites.sites = vec![site("github.com", "")];
+    app.selected = Some(0);
+    app.show_password = true;
+    let ctx = egui::Context::default();
+    app.lock_when_idle(&ctx);
+    assert!(app.keys.is_some(), "not idle yet");
+    app.active_at = SystemTime::now() - LOCK_AFTER;
+    app.lock_when_idle(&ctx);
+    assert!(app.keys.is_none() && app.selected.is_none() && !app.show_password);
+    assert!(matches!(app.screen, Screen::Unlock));
+
+    let mut harness = harness(app_with_keys(temp_dir("lock-button").join("sites.json")), Harness::builder());
+    harness.get_by_label("Lock").click();
+    harness.run();
+    assert!(harness.state().keys.is_none());
+    assert!(matches!(harness.state().screen, Screen::Unlock));
+}
+
 #[test]
 fn own_master_password_is_hidden_until_shown() {
     let mut app = App::start(temp_dir("reveal").join("sites.json"), Ok(None));
@@ -400,6 +462,10 @@ fn screenshots() {
         harness.render().unwrap().save(out.join(format!("{name}.png"))).unwrap();
     };
 
+    shoot("0-unlock", &|app| {
+        app.lock();
+        app.error = "That isn't your master password.".into();
+    });
     shoot("1-setup", &|app| {
         app.keys = None;
         app.screen = Screen::Setup;
@@ -500,4 +566,15 @@ fn site_title() {
     assert_eq!(site_title(&format!("<title>{}</title>", "x".repeat(60))), None);
     assert_eq!(store::title_case("my bank"), "My Bank");
     assert_eq!(store::title_case("github.com"), "github.com");
+}
+
+#[test]
+fn hovering_an_icon_button_moves_nothing() {
+    let mut app = App::start(temp_dir("hover").join("sites.json"), Ok(Some(Stored::from_master(&MASTER))));
+    app.screen = Screen::Unlock;
+    let mut harness = harness(app, Harness::builder());
+    let before = harness.get_by_role(Role::PasswordInput).rect();
+    harness.get_by_label("Show password").hover();
+    harness.run();
+    assert_eq!(harness.get_by_role(Role::PasswordInput).rect(), before);
 }
