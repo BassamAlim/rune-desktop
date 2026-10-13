@@ -1,3 +1,4 @@
+mod bitwarden;
 mod store;
 mod theme;
 
@@ -865,7 +866,20 @@ impl App {
         Ok(format!("Exported {} sites to {}.", self.sites.sites.len(), path.display()))
     }
 
+    /// A Rune site list, or a Bitwarden export.
     fn import_sites(&mut self, path: &Path) -> Result<String, String> {
+        // A file that can't be read is left for `SiteList::load` below to explain.
+        if let (Ok(mut text), Some(keys)) = (std::fs::read_to_string(path), &self.keys) {
+            let mut sealer = seal_key(&keys.master);
+            let converted = bitwarden::convert(&text, &sealer, store::nonce);
+            sealer.zeroize();
+            // A Bitwarden export is every password in plain text.
+            text.zeroize();
+            if let Some(converted) = converted? {
+                return self.import_bitwarden(converted);
+            }
+        }
+
         let imported = SiteList::load(path)?;
         let mut updated = self.sites.clone();
         let (added, replaced) = updated.merge(imported);
@@ -873,6 +887,38 @@ impl App {
         self.sites = updated;
         self.select(None);
         Ok(format!("Imported: {added} new, {replaced} updated."))
+    }
+
+    /// Adds what isn't in Rune yet. An account already here is left alone: it may have been
+    /// switched to Rune's password since, and the export's would undo that.
+    fn import_bitwarden(&mut self, converted: bitwarden::Converted) -> Result<String, String> {
+        let mut updated = self.sites.clone();
+        let (mut added, mut already) = (0, 0);
+        for site in converted.sites {
+            match updated.put(site, None, store::now()) {
+                Ok(()) => added += 1,
+                Err(_) => already += 1,
+            }
+        }
+        updated.save(&self.sites_path)?;
+        self.sites = updated;
+        self.select(None);
+
+        let skipped: Vec<String> = [
+            (already, "already in Rune"),
+            (converted.duplicates, "listed twice"),
+            (converted.no_password, "without a password"),
+            (converted.not_logins, "not logins (notes, cards, identities)"),
+        ]
+        .iter()
+        .filter(|(n, _)| *n > 0)
+        .map(|(n, why)| format!("{n} {why}"))
+        .collect();
+        let skipped = if skipped.is_empty() { String::new() } else { format!(" Skipped: {}.", skipped.join(", ")) };
+        Ok(format!(
+            "Imported {added} from Bitwarden, each keeping its password until you switch it to Rune's.{skipped} \
+             Now delete the export file: it holds your passwords in plain text."
+        ))
     }
 
     fn settings_screen(&mut self, ui: &mut Ui) -> Option<Screen> {
@@ -946,7 +992,8 @@ impl App {
             ui.set_width(ui.available_width());
             ui.label(RichText::new("Site list").strong());
             ui.label(theme::small(
-                "Site names and settings, never passwords. Use the file to back up or to move your sites to another device.",
+                "Site names and settings, never passwords. Use the file to back up or to move your sites to another device. \
+                 Import also takes a Bitwarden export (unencrypted .json): each login keeps its password until you switch it.",
             ));
             ui.horizontal(|ui| {
                 let idle = settings.dialog.is_none();
@@ -1273,7 +1320,7 @@ fn site_row(
 fn open_dialog(kind: Dialog, ctx: egui::Context) -> Receiver<Option<PathBuf>> {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
-        let dialog = rfd::FileDialog::new().add_filter("Rune site list", &["json"]);
+        let dialog = rfd::FileDialog::new().add_filter("Rune site list or Bitwarden export", &["json"]);
         let path = match kind {
             Dialog::Export => dialog.set_file_name("rune-sites.json").save_file(),
             Dialog::Import => dialog.pick_file(),

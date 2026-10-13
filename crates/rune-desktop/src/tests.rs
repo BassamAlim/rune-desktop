@@ -301,6 +301,70 @@ fn a_phone_with_the_same_master_syncs_over_the_network() {
 }
 
 #[test]
+fn a_bitwarden_export_comes_in_with_its_passwords_kept() {
+    let dir = temp_dir("bitwarden");
+    std::fs::create_dir_all(&dir).unwrap();
+    let export = dir.join("bitwarden_export.json");
+    std::fs::write(&export, r#"{
+      "encrypted": false,
+      "folders": [],
+      "items": [
+        { "type": 1, "name": "GitHub", "notes": "recovery codes: 1234",
+          "login": { "username": "Bassam", "password": "Hunter2!", "totp": "SEED",
+                     "uris": [ { "match": null, "uri": "https://www.GitHub.com:443/login?x=1" },
+                               { "match": null, "uri": "androidapp://com.github.android" } ] } },
+        { "type": 1, "name": "My Bank", "login": { "username": null, "password": "pin-4321",
+                     "uris": [ { "uri": "androidapp://com.example.bank" } ] } },
+        { "type": 1, "name": "GitHub again", "login": { "username": "bassam", "password": "other",
+                     "uris": [ { "uri": "github.com" } ] } },
+        { "type": 1, "name": "Mail", "login": { "username": "me", "password": "already-switched",
+                     "uris": [ { "uri": "https://mail.example" } ] } },
+        { "type": 1, "name": "No password", "login": { "username": "x", "password": null, "uris": [] } },
+        { "type": 2, "name": "A secure note", "notes": "secret", "secureNote": { "type": 0 } },
+        { "type": 3, "name": "A card", "card": { "number": "4111" } }
+      ]
+    }"#).unwrap();
+
+    let path = dir.join("sites.json");
+    let mut app = app_with_keys(path.clone());
+    app.sites.sites = vec![site("mail.example", "me")];
+    let message = app.import_sites(&export).unwrap();
+
+    assert!(message.starts_with("Imported 2 from Bitwarden"), "{message}");
+    for skipped in ["1 already in Rune", "1 listed twice", "1 without a password", "2 not logins"] {
+        assert!(message.contains(skipped), "{message}");
+    }
+
+    let sites = &app.sites.sites;
+    assert_eq!(sites.iter().map(|s| (s.site.as_str(), s.login.as_str())).collect::<Vec<_>>(), [
+        ("github.com", "bassam"),
+        ("mail.example", "me"),
+        ("my bank", ""),
+    ]);
+    let seal_key = rune_core::seal_key(&MASTER);
+    assert_eq!(rune_core::open(&seal_key, &sites[0].sealed).unwrap(), "Hunter2!");
+    assert_eq!(sites[0].apps, ["com.github.android"]);
+    assert_eq!(rune_core::open(&seal_key, &sites[2].sealed).unwrap(), "pin-4321");
+    assert_eq!(sites[2].apps, ["com.example.bank"]);
+    assert_eq!(sites[1].sealed, "", "an account already in Rune keeps what it has");
+    assert!(sites[0].modified > 0, "stamped, so sync carries it to the phone");
+
+    // Nothing from the export is on disk in the clear, and notes and TOTP seeds stay behind.
+    let saved = std::fs::read_to_string(&path).unwrap();
+    for secret in ["Hunter2!", "pin-4321", "recovery codes", "SEED", "4111"] {
+        assert!(!saved.contains(secret), "{secret} was written to the site list");
+    }
+
+    // An encrypted export can't be read, and says how to get one that can.
+    std::fs::write(&export, r#"{ "encrypted": true, "passwordProtected": true, "data": "2.abc" }"#).unwrap();
+    assert!(app.import_sites(&export).unwrap_err().contains("encrypted"));
+
+    // A Rune site list still imports as before.
+    SiteList { version: 1, sites: vec![site("new.example", "")], deleted: vec![] }.save(&export).unwrap();
+    assert_eq!(app.import_sites(&export).unwrap(), "Imported: 1 new, 0 updated.");
+}
+
+#[test]
 fn strength_ranks_common_passwords_weak_and_passphrases_strong() {
     assert_eq!(strength("Bassam2024!").1, theme::DANGER);
     assert_eq!(strength("password123").1, theme::DANGER);

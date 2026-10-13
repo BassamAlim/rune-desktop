@@ -226,6 +226,7 @@ Kotlin, Jetpack Compose (Material 3), Hilt, Navigation Compose, DataStore, `andr
 - Master key stored in the Secret Service keyring (KWallet on KDE) via the `keyring` crate. Setup is the same as Android's (generated or own). Anyone at the unlocked desktop session can open Rune — the keyring is the lock.
 - Copy flags the password so clipboard managers (Klipper) keep it out of history, and clears it after 30 s if it is still what is on the clipboard.
 - Site list at `$XDG_DATA_HOME/rune/sites.json`. Export and import through the system file dialog.
+- Import also takes a Bitwarden export (unencrypted `.json`), for moving in. Each login becomes a site named by its first web address (or its name, for an app or an entry with no address), with its username, any `androidapp://` addresses as linked apps, and its password kept sealed (§3.1) until switched to Rune's. An account already in Rune is left alone. Left behind on purpose: notes (the site list isn't encrypted), TOTP seeds, cards and identities. Desktop only, where the master key is at hand; sync (§3.3) carries the result to the phone.
 - This repo owns `SPEC.md` and `vectors.json`; `cargo run -p rune-core --example gen-vectors` regenerates the vectors. `rune-android` holds a copy of `vectors.json` only.
 
 ## 5a. Design
@@ -246,7 +247,7 @@ vector drawables.
 
 ## 7. Not in v1
 
-- Sync of any kind, multiple profiles, storing passwords Rune didn't generate.
+- Sync beyond the local network (§3.3), multiple profiles, storing passwords for good (a kept one, §3.1, is until it is switched).
 - Inline (keyboard) autofill suggestions; the dropdown is used.
 - A light theme.
 - Credential Manager provider (Android 14+) — add when apps you use need it.

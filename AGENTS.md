@@ -30,6 +30,10 @@ The passphrase wordlist `crates/rune-core/words.txt` is shared the same way, as
   the window reloads when told. `main.rs`
   stays screens only, which keeps the screens testable with `egui_kittest`.
 
+`bitwarden.rs` turns a Bitwarden export into sites with kept passwords (SPEC §5). It is the one
+place plain-text passwords from outside are read: seal them straight away, zeroize what was
+read, and never write notes, TOTP seeds or anything else from the export to the site list.
+
 ## Design
 
 `theme.rs` is the only source of colour, radius and spacing, and its helpers

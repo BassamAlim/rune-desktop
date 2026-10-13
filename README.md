@@ -30,6 +30,7 @@ data.
 - **Same passwords on your phone.** Set both apps up with the same master password; the
   four-character fingerprint shows they match.
 - **Export and import.** The site list is one JSON file, shared with the Android app.
+- **Move in from Bitwarden.** Import its unencrypted `.json` export and every login keeps its password, encrypted under your master password, until you change it to Rune's.
 
 ## Layout
 

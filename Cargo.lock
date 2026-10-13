@@ -3374,6 +3374,8 @@ dependencies = [
  "keyring",
  "rfd",
  "rune-core",
+ "serde",
+ "serde_json",
  "ureq",
  "zeroize",
  "zxcvbn",
