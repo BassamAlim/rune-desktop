@@ -20,7 +20,10 @@ data.
 ## Features
 
 - **Nothing to steal.** Passwords are worked out from your master password and the site's
-  name. They are never written to disk.
+  name. They are never written to disk, and the master key isn't kept on this computer at all.
+- **Approved on your phone.** Showing a password asks Rune on your phone, which shows the same
+  six-digit code and asks for your fingerprint. Without the phone, type the master password
+  instead; it's used once and forgotten.
 - **Sites.** A searchable list of site names and logins. Two logins on one site get two
   different passwords.
 - **Per-site settings.** Length, which kinds of character, and a counter you raise to get a
@@ -30,13 +33,14 @@ data.
 - **Same passwords on your phone.** Set both apps up with the same master password; the
   four-character fingerprint shows they match.
 - **Export and import.** The site list is one JSON file, shared with the Android app.
-- **Move in from Bitwarden.** Import its unencrypted `.json` export and every login keeps its password, encrypted under your master password, until you change it to Rune's.
+- **Move in from Bitwarden.** Import its unencrypted `.json` export and every login keeps its password, sealed by your phone, until you change it to Rune's.
 
 ## Layout
 
 ```
 crates/rune-core/      the rune/v1 algorithm and the site list (no UI, no keyring)
-crates/rune-desktop/   the egui app: main.rs (screens), theme.rs (look), store.rs (keyring, clipboard)
+crates/rune-desktop/   the egui app: main.rs (screens), theme.rs (look), store.rs (keyring, clipboard,
+                       sync and approvals from the phone)
 assets/                logo, in-app mark, fonts, launcher entry
 scripts/mark/          the mark and the generator for every logo asset, Android included
 scripts/install.sh     build a release binary and install it for the current user
@@ -61,7 +65,7 @@ cargo test -p rune-desktop -- --ignored clipboard     # overwrites the clipboard
 ## Where things are kept
 
 - Keys: the Secret Service keyring (KWallet), service `rune`, account `keys`: the sync key and
-  fingerprint only. The master password is asked at each launch and after 5 idle minutes.
+  fingerprint only, never the master key. Revealed passwords are forgotten after 5 idle minutes.
 - Site list: `~/.local/share/rune/sites.json`. It holds names and settings, never passwords.
 
 ## Changing the algorithm

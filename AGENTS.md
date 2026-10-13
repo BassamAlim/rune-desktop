@@ -25,14 +25,21 @@ The passphrase wordlist `crates/rune-core/words.txt` is shared the same way, as
   counters can't be recomputed, so overwriting the file loses passwords.
 - **Machine access goes through `store.rs`**: keyring, clipboard, paths, randomness, and all
   networking: each site's `/favicon.ico` and homepage (its logo and display name, cached under
-  `~/.cache/rune/icons` and `names`), and the listener that answers the phone's sync (SPEC §3.3).
+  `~/.cache/rune/icons` and `names`), and the listener that answers the phone's sync (SPEC §3.3)
+  and hands it requests to approve (§3.4).
   That listener merges into `sites.json` itself, so sync works while the window is minimised;
   the window reloads when told. `main.rs`
   stays screens only, which keeps the screens testable with `egui_kittest`.
 
 `bitwarden.rs` turns a Bitwarden export into sites with kept passwords (SPEC §5). It is the one
-place plain-text passwords from outside are read: seal them straight away, zeroize what was
-read, and never write notes, TOTP seeds or anything else from the export to the site list.
+place plain-text passwords from outside are read: they go straight to the phone to seal (an
+`import` request), zeroize what was read, and never write notes, TOTP seeds or anything else
+from the export to the site list.
+
+**The desktop never keeps the master key** (SPEC §3.4). Anything that needs it is a request to
+the phone (`SyncListener::ask`), or, without the phone, the master password typed for that one
+action: `App::answer_here` does the phone's work and the key is zeroed straight after. Don't add
+a path that holds the master key longer, or stores it.
 
 ## Design
 

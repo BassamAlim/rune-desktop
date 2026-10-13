@@ -13,15 +13,16 @@ use rune_core::{
     normalize, open, password, seal, seal_key, site_key,
 };
 use eframe::egui::{self, Align, Key, Layout, RichText, Sense, Ui};
-use store::{Keys, Stored};
+use rune_core::{Revealed, ToKeep};
+use store::{Approval, Keys, Stored};
 use theme::icon;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 /// Content never gets wider than this; on a wide window it is centred.
 const CONTENT_WIDTH: f32 = 520.0;
 const COPIED_FLASH: Duration = Duration::from_secs(2);
-/// Idle this long and the master key is forgotten until the master password is typed again.
-const LOCK_AFTER: Duration = Duration::from_secs(5 * 60);
+/// Idle this long and the passwords the phone revealed are forgotten.
+const FORGET_AFTER: Duration = Duration::from_secs(5 * 60);
 
 struct Editor {
     /// Index in the site list when editing; `None` when adding.
@@ -140,11 +141,49 @@ struct Settings {
     dialog: Option<(Dialog, Receiver<Option<PathBuf>>)>,
 }
 
+/// What a request to the phone is for.
+enum Purpose {
+    Show { site: String, login: String },
+    Keep(ToKeep),
+    /// A Bitwarden export, and what of it was left out, for the message afterwards.
+    Import { items: Vec<ToKeep>, skipped: String },
+}
+
+impl Purpose {
+    fn to_ask(&self) -> store::Ask {
+        match self {
+            Purpose::Show { site, login } => store::Ask::Show { site: site.clone(), login: login.clone() },
+            Purpose::Keep(item) => store::Ask::Keep(vec![item.clone()]),
+            Purpose::Import { items, .. } => store::Ask::Import(items.clone()),
+        }
+    }
+
+    /// Asked from this site's card.
+    fn is_for(&self, entry: &Site) -> bool {
+        match self {
+            Purpose::Show { site, login } => *site == entry.site && *login == entry.login,
+            Purpose::Keep(item) => item.site.site == entry.site && item.site.login == entry.login,
+            Purpose::Import { .. } => false,
+        }
+    }
+}
+
+struct Asking {
+    purpose: Purpose,
+    /// `None` when Rune isn't listening for the phone: then only the master password will do.
+    request: Option<store::Request>,
+    since: Instant,
+    code: Option<String>,
+    /// `keep` / `import`: the phone approved; the passwords go once the code is confirmed here.
+    ready: bool,
+    /// The master password being typed instead, and the key being derived from it.
+    typed: Option<Zeroizing<String>>,
+    deriving: Option<Receiver<Keys>>,
+}
+
 enum Screen {
     Setup,
-    Unlock,
-    /// `unlocking`: checked against the stored fingerprint, rather than shown for setup.
-    Deriving { rx: Receiver<Keys>, unlocking: bool },
+    Deriving { rx: Receiver<Keys> },
     Confirm { keys: Keys },
     Sites,
     Editor(Editor),
@@ -164,10 +203,12 @@ struct App {
     confirm: String,
     show_master: bool,
 
-    // Set once setup is done; `keys` only while unlocked.
+    // Set once setup is done. Never the master key: the phone has that (SPEC §3.4).
     stored: Option<Stored>,
-    keys: Option<Keys>,
-    /// Wall-clock, so time asleep counts toward the lock.
+    /// What the phone (or the master password, typed instead) revealed for one site.
+    revealed: Option<(String, String, Revealed)>,
+    asking: Option<Asking>,
+    /// Wall-clock, so time asleep counts toward forgetting `revealed`.
     active_at: SystemTime,
     sites: SiteList,
     sites_path: PathBuf,
@@ -213,7 +254,8 @@ impl App {
             confirm: String::new(),
             show_master: false,
             stored: None,
-            keys: None,
+            revealed: None,
+            asking: None,
             active_at: SystemTime::now(),
             sites: SiteList { version: 1, sites: vec![], deleted: vec![] },
             sites_path,
@@ -243,7 +285,7 @@ impl App {
         match stored {
             Ok(Some(stored)) => {
                 app.stored = Some(stored);
-                app.screen = Screen::Unlock;
+                app.screen = Screen::Sites;
             }
             Ok(None) => {}
             Err(e) => app.error = format!("Can't reach the system keyring: {e}"),
@@ -353,52 +395,22 @@ impl App {
         self.error.clear();
         self.confirm.zeroize();
 
-        Some(Screen::Deriving { rx: derive(password, ui.ctx().clone()), unlocking: false })
+        Some(Screen::Deriving { rx: derive(password, ui.ctx().clone()) })
     }
 
-    fn unlock_screen(&mut self, ui: &mut Ui) -> Option<Screen> {
-        ui.add_space(ui.available_height() * 0.2);
-        ui.vertical_centered(|ui| {
-            ui.add(self.mark(ui, 64.0));
-            ui.add_space(4.0);
-            ui.heading("Unlock Rune");
-        });
-        ui.add_space(16.0);
-        let field = theme::field(ui, "Master password", |ui| {
-            theme::password_field(ui, &mut self.password, &mut self.show_master)
-        });
-        if ui.memory(|m| m.focused().is_none()) {
-            field.request_focus();
-        }
-        ui.add_space(8.0);
-        let submit = ui.add_sized([ui.available_width(), 40.0], theme::primary_button(icon::LOCK_OPEN, "Unlock")).clicked()
-            || ui.input(|i| i.key_pressed(Key::Enter));
-        if !submit || self.password.is_empty() {
-            return None;
-        }
-        self.error.clear();
-        Some(Screen::Deriving { rx: derive(std::mem::take(&mut self.password), ui.ctx().clone()), unlocking: true })
-    }
-
-    /// Forgets the master key and everything shown with it; the site list and sync carry on.
-    fn lock(&mut self) {
-        self.keys = None;
-        self.select(None);
-        self.password.zeroize();
-        self.error.clear();
-        self.screen = Screen::Unlock;
-    }
-
-    /// Locks once idle for [`LOCK_AFTER`]. Runs in `logic`, which eframe calls even while the
-    /// window is minimised.
-    fn lock_when_idle(&mut self, ctx: &egui::Context) {
-        if self.keys.is_none() {
+    /// Forgets what the phone revealed once idle for [`FORGET_AFTER`]. Runs in `logic`, which
+    /// eframe calls even while the window is minimised.
+    fn forget_when_idle(&mut self, ctx: &egui::Context) {
+        if self.revealed.is_none() {
             return;
         }
         let idle = self.active_at.elapsed().unwrap_or_default();
-        match LOCK_AFTER.checked_sub(idle) {
+        match FORGET_AFTER.checked_sub(idle) {
             Some(left) if !left.is_zero() => ctx.request_repaint_after(left),
-            _ => self.lock(),
+            _ => {
+                self.revealed = None;
+                self.show_password = false;
+            }
         }
     }
 
@@ -430,7 +442,6 @@ impl App {
                 match store::save_keys(store::ACCOUNT, &stored) {
                     Ok(()) => {
                         self.stored = Some(stored);
-                        self.keys = Some(Keys { ..*keys });
                         if let Some(mut phrase) = self.generated.take() {
                             phrase.zeroize();
                         }
@@ -466,8 +477,18 @@ impl App {
     }
 
     fn select(&mut self, index: Option<usize>) {
+        let entry = index.and_then(|i| self.sites.sites.get(i));
+        // What was revealed or asked for another site goes; the same site, re-selected after a
+        // save or a sync, keeps it.
+        let same = |site: &str, login: &str| entry.is_some_and(|e| e.site == site && e.login == login);
+        if !self.revealed.as_ref().is_some_and(|(site, login, _)| same(site, login)) {
+            self.revealed = None;
+            self.show_password = false;
+        }
+        if self.asking.as_ref().is_some_and(|a| !matches!(a.purpose, Purpose::Import { .. }) && !entry.is_some_and(|e| a.purpose.is_for(e))) {
+            self.asking = None;
+        }
         self.selected = index;
-        self.show_password = false;
         self.copied_at = None;
         if let Some(mut typed) = self.keeping.take() {
             typed.zeroize();
@@ -477,7 +498,6 @@ impl App {
 
     fn sites_screen(&mut self, ui: &mut Ui) -> Option<Screen> {
         let mut next = None;
-        let mut lock = false;
         ui.horizontal(|ui| {
             ui.add(self.mark(ui, 30.0));
             ui.heading("rune");
@@ -485,13 +505,8 @@ impl App {
                 if theme::icon_button(ui, icon::GEAR, "Settings").clicked() {
                     next = Some(Screen::Settings(Settings::default()));
                 }
-                lock = theme::icon_button(ui, icon::LOCK, "Lock").clicked();
             });
         });
-        if lock {
-            self.lock();
-            return None;
-        }
         ui.add_space(4.0);
 
         if self.sites.sites.is_empty() {
@@ -569,24 +584,13 @@ impl App {
 
     fn detail_card(&mut self, ui: &mut Ui, index: usize) -> Option<Screen> {
         let site = self.sites.sites[index].clone();
-        let keys = self.keys.as_ref()?;
-        let generated = password(
-            &site_key(&keys.master, &site.site, &site.login, site.counter),
-            site.length,
-            &site.classes,
-            &site.symbols,
-        );
-        // Changing a password on the site usually asks for the old one too.
-        let mut previous = (site.counter > 1)
-            .then(|| {
-                let key = site_key(&keys.master, &site.site, &site.login, site.counter - 1);
-                password(&key, site.length, &site.classes, &site.symbols).ok()
-            })
-            .flatten();
-        // §3.1: a site not yet switched to Rune's password shows its own, kept sealed.
-        let mut sealer = seal_key(&keys.master);
-        let mut kept = (!site.sealed.is_empty()).then(|| open(&sealer, &site.sealed));
-        // Some("") clears the kept password; Some(sealed) keeps a new one.
+        let revealed = self
+            .revealed
+            .as_ref()
+            .filter(|(name, login, _)| *name == site.site && *login == site.login)
+            .map(|(_, _, revealed)| revealed.clone());
+        let asked_here = self.asking.as_ref().is_some_and(|a| a.purpose.is_for(&site));
+        // Some("") clears the kept password.
         let mut new_sealed: Option<String> = None;
         let mut next = None;
         theme::card().show(ui, |ui| {
@@ -609,83 +613,19 @@ impl App {
                     }
                 });
             });
-            let mut runes = match generated {
-                Ok(pw) => pw,
-                Err(e) => {
-                    ui.colored_label(theme::DANGER, format!("This site's settings are invalid: {e}"));
-                    return;
-                }
-            };
-            let mut pw = match &kept {
-                Some(Ok(old)) => {
-                    ui.label(theme::small("Your old password. Change it on the site to Rune's, then switch."));
-                    old.clone()
-                }
-                Some(Err(e)) => {
-                    ui.colored_label(theme::DANGER, format!("The kept password can't be read: {e}"));
-                    runes.clone()
-                }
-                None => runes.clone(),
-            };
 
-            egui::Frame::new()
-                .fill(theme::BG)
-                .corner_radius(theme::RADIUS)
-                .inner_margin(egui::Margin::symmetric(12, 6))
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            let (glyph, label) = if self.show_password {
-                                (icon::EYE_SLASH, "Hide password")
-                            } else {
-                                (icon::EYE, "Show password")
-                            };
-                            if theme::icon_button(ui, glyph, label).clicked() {
-                                self.show_password = !self.show_password;
-                            }
-                            ui.with_layout(Layout::left_to_right(Align::Center).with_main_wrap(true), |ui| {
-                                let shown = if self.show_password { pw.clone() } else { "•".repeat(pw.len()) };
-                                ui.add(egui::Label::new(RichText::new(shown).monospace().size(16.0)).wrap());
-                            });
-                        });
-                    });
-                });
-
-            let just_copied = self.copied_at.is_some_and(|at| at.elapsed() < COPIED_FLASH);
-            let (glyph, label) = if just_copied { (icon::CHECK, "Copied") } else { (icon::COPY, "Copy password") };
-            if ui.add_sized([ui.available_width(), 40.0], theme::primary_button(glyph, label)).clicked() {
-                self.copy(pw.clone());
-            }
-            if just_copied {
-                ui.ctx().request_repaint_after(COPIED_FLASH);
-            }
-            pw.zeroize();
-
-            if kept.is_some() {
-                // The site's change-password form wants the new one too.
-                ui.horizontal_wrapped(|ui| {
-                    if ui.add(theme::button(icon::COPY, "Copy Rune's password")).clicked() {
-                        self.copy(runes.clone());
-                    }
-                    if !self.confirm_switch {
-                        if ui.add(theme::button(icon::ARROWS_CLOCKWISE, "Switch to Rune's password")).clicked() {
-                            self.confirm_switch = true;
-                        }
-                    } else if ui.add(theme::danger_button("", "Yes, I've changed it")).clicked() {
-                        new_sealed = Some(String::new());
-                    }
-                });
-                if self.confirm_switch {
-                    ui.label(theme::small("Rune forgets the old password and shows its own from now on."));
-                }
-            } else if let Some(previous) = &previous
-                && ui.add(theme::button(icon::CLOCK_COUNTER_CLOCKWISE, "Copy previous password")).clicked()
-            {
-                self.copy(previous.clone());
+            if asked_here {
+                self.asking_panel(ui);
+            } else if let Some(revealed) = &revealed {
+                self.revealed_password(ui, revealed, &mut new_sealed);
+            } else if ui.add_sized([ui.available_width(), 40.0], theme::primary_button(icon::EYE, "Show password")).clicked() {
+                self.ask(Purpose::Show { site: site.site.clone(), login: site.login.clone() });
             }
 
-            if kept.is_none() {
+            // §3.1: keeping the site's own password until it is changed to Rune's.
+            if site.sealed.is_empty() && !asked_here {
                 let mut cancel = false;
+                let mut keep = None;
                 match &mut self.keeping {
                     None => {
                         if ui.add(theme::button(icon::KEY, "Use my old password for now")).clicked() {
@@ -698,17 +638,20 @@ impl App {
                         });
                         ui.horizontal(|ui| {
                             if ui.add(theme::button(icon::CHECK, "Keep it")).clicked() && !typed.is_empty() {
-                                new_sealed = Some(seal(&sealer, typed, store::nonce()));
+                                keep = Some(ToKeep { site: site.clone(), password: std::mem::take(typed) });
+                                cancel = true;
                             }
-                            cancel = ui.button("Cancel").clicked();
+                            cancel |= ui.button("Cancel").clicked();
                         });
                     }
                 }
                 if cancel && let Some(mut typed) = self.keeping.take() {
                     typed.zeroize();
                 }
+                if let Some(keep) = keep {
+                    self.ask(Purpose::Keep(keep));
+                }
             }
-            runes.zeroize();
 
             ui.label(theme::small(if self.copied_at.is_some() {
                 format!("The clipboard is cleared after {} seconds.", store::CLIPBOARD_CLEAR_AFTER.as_secs())
@@ -721,13 +664,6 @@ impl App {
                 )
             }));
         });
-        if let Some(previous) = &mut previous {
-            previous.zeroize();
-        }
-        if let Some(Ok(old)) = &mut kept {
-            old.zeroize();
-        }
-        sealer.zeroize();
         if let Some(sealed) = new_sealed {
             let mut updated = self.sites.clone();
             let changed = Site { sealed, ..updated.sites[index].clone() };
@@ -740,6 +676,228 @@ impl App {
             }
         }
         next
+    }
+
+    /// The site's password once revealed: masked with an eye, copy, and the kept or previous one.
+    fn revealed_password(&mut self, ui: &mut Ui, revealed: &Revealed, new_sealed: &mut Option<String>) {
+        if revealed.kept.is_some() {
+            ui.label(theme::small("Your old password. Change it on the site to Rune's, then switch."));
+        }
+        let pw = revealed.kept.as_ref().unwrap_or(&revealed.password);
+        egui::Frame::new()
+            .fill(theme::BG)
+            .corner_radius(theme::RADIUS)
+            .inner_margin(egui::Margin::symmetric(12, 6))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let (glyph, label) = if self.show_password {
+                            (icon::EYE_SLASH, "Hide password")
+                        } else {
+                            (icon::EYE, "Show password")
+                        };
+                        if theme::icon_button(ui, glyph, label).clicked() {
+                            self.show_password = !self.show_password;
+                        }
+                        ui.with_layout(Layout::left_to_right(Align::Center).with_main_wrap(true), |ui| {
+                            let mut shown = if self.show_password { pw.clone() } else { "•".repeat(pw.chars().count()) };
+                            ui.add(egui::Label::new(RichText::new(shown.as_str()).monospace().size(16.0)).wrap());
+                            shown.zeroize();
+                        });
+                    });
+                });
+            });
+
+        let just_copied = self.copied_at.is_some_and(|at| at.elapsed() < COPIED_FLASH);
+        let (glyph, label) = if just_copied { (icon::CHECK, "Copied") } else { (icon::COPY, "Copy password") };
+        if ui.add_sized([ui.available_width(), 40.0], theme::primary_button(glyph, label)).clicked() {
+            self.copy(pw.clone());
+        }
+        if just_copied {
+            ui.ctx().request_repaint_after(COPIED_FLASH);
+        }
+
+        if revealed.kept.is_some() {
+            // The site's change-password form wants the new one too.
+            ui.horizontal_wrapped(|ui| {
+                if ui.add(theme::button(icon::COPY, "Copy Rune's password")).clicked() {
+                    self.copy(revealed.password.clone());
+                }
+                if !self.confirm_switch {
+                    if ui.add(theme::button(icon::ARROWS_CLOCKWISE, "Switch to Rune's password")).clicked() {
+                        self.confirm_switch = true;
+                    }
+                } else if ui.add(theme::danger_button("", "Yes, I've changed it")).clicked() {
+                    *new_sealed = Some(String::new());
+                }
+            });
+            if self.confirm_switch {
+                ui.label(theme::small("Rune forgets the old password and shows its own from now on."));
+            }
+        } else if let Some(previous) = &revealed.previous
+            && ui.add(theme::button(icon::CLOCK_COUNTER_CLOCKWISE, "Copy previous password")).clicked()
+        {
+            self.copy(previous.clone());
+        }
+    }
+
+    // ---- Asking the phone (SPEC §3.4) ------------------------------------------------------
+
+    /// Asks the phone, or, when Rune isn't listening for it, goes straight to the master password.
+    fn ask(&mut self, purpose: Purpose) {
+        self.error.clear();
+        let request = self.sync.as_ref().map(|listener| listener.ask(purpose.to_ask()));
+        let typed = request.is_none().then(Zeroizing::default);
+        self.asking = Some(Asking { purpose, request, since: Instant::now(), code: None, ready: false, typed, deriving: None });
+    }
+
+    /// Takes in what the phone, or the master password typed instead, came back with.
+    fn poll_asking(&mut self, ctx: &egui::Context) {
+        let Some(asking) = &mut self.asking else {
+            return;
+        };
+        let mut outcome = None;
+        if let Some(request) = &asking.request {
+            // The listener's thread has no way to wake the window.
+            ctx.request_repaint_after(Duration::from_millis(250));
+            for event in request.events.try_iter() {
+                match event {
+                    Approval::Code(code) => asking.code = Some(code),
+                    Approval::Ready => asking.ready = true,
+                    done => outcome = Some(done),
+                }
+            }
+            if outcome.is_none() && asking.code.is_none() && asking.typed.is_none() && asking.since.elapsed() > store::ASK_FOR {
+                outcome = Some(Approval::Failed("your phone didn't answer. Open Rune on it, on this Wi-Fi".into()));
+            }
+        }
+        if let Some(rx) = &asking.deriving
+            && let Ok(keys) = rx.try_recv()
+        {
+            asking.deriving = None;
+            if self.stored.as_ref().is_some_and(|s| s.fingerprint == fingerprint(&keys.master)) {
+                outcome = Some(self.answer_here(&keys.master));
+            } else {
+                self.error = "That isn't your master password.".to_string();
+                return;
+            }
+        }
+        if let Some(outcome) = outcome {
+            self.finish(outcome);
+        }
+    }
+
+    /// The phone's work, done here with the master key typed instead (SPEC §3.4, without the phone).
+    fn answer_here(&mut self, master: &rune_core::Key) -> Approval {
+        let Some(asking) = &self.asking else {
+            return Approval::Failed("nothing was asked".into());
+        };
+        let result = match &asking.purpose {
+            Purpose::Show { site, login } => match self.sites.sites.iter().find(|s| s.site == *site && s.login == *login) {
+                Some(entry) => reveal(master, entry).map(Approval::Revealed),
+                None => Ok(Approval::Missing),
+            },
+            Purpose::Keep(item) => keep_here(&mut self.sites, &self.sites_path, master, std::slice::from_ref(item), true),
+            Purpose::Import { items, .. } => keep_here(&mut self.sites, &self.sites_path, master, items, false),
+        };
+        result.unwrap_or_else(Approval::Failed)
+    }
+
+    fn finish(&mut self, outcome: Approval) {
+        let Some(asking) = self.asking.take() else {
+            return;
+        };
+        match (asking.purpose, outcome) {
+            (Purpose::Show { site, login }, Approval::Revealed(revealed)) => {
+                self.revealed = Some((site, login, revealed));
+                self.show_password = false;
+                self.active_at = SystemTime::now();
+            }
+            (_, Approval::Missing) => {
+                self.error = "Your phone doesn't have this site yet. Open Rune on it so the two sync, then try again.".into()
+            }
+            (_, Approval::Declined) => self.error = "Declined on your phone.".into(),
+            (Purpose::Import { skipped, .. }, Approval::Done { added, already }) => {
+                let already = if already > 0 { format!(" {already} already in Rune.") } else { String::new() };
+                if let Screen::Settings(settings) = &mut self.screen {
+                    settings.message = format!(
+                        "Imported {added} from Bitwarden, each keeping its password until you switch it to Rune's.{already}{skipped} \
+                         Now delete the export file: it holds your passwords in plain text."
+                    );
+                }
+            }
+            // A kept password comes back with the phone's sync, or is already saved here.
+            (_, Approval::Done { .. }) => self.reload_sites = true,
+            (_, Approval::Failed(e)) => self.error = format!("Couldn't ask your phone: {e}."),
+            (_, other) => self.error = format!("Your phone answered something unexpected ({other:?})."),
+        }
+    }
+
+    /// What's being asked, the code to compare, and the master password as the way round.
+    fn asking_panel(&mut self, ui: &mut Ui) {
+        let Some(asking) = &mut self.asking else {
+            return;
+        };
+        let mut cancel = false;
+        egui::Frame::new().fill(theme::BG).corner_radius(theme::RADIUS).inner_margin(egui::Margin::same(12)).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            if let Some(typed) = &mut asking.typed {
+                if asking.request.is_none() {
+                    let why = self.sync_error.as_deref().map(|e| format!(": {e}")).unwrap_or_default();
+                    ui.add(egui::Label::new(theme::small(format!("Rune isn't listening for your phone{why}."))).wrap());
+                }
+                if asking.deriving.is_some() {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(theme::muted("Checking…"));
+                    });
+                    return;
+                }
+                let field = theme::field(ui, "Master password", |ui| ui.add(theme::text_field(&mut *typed).password(true)));
+                if asking.request.is_none() && ui.memory(|m| m.focused().is_none()) {
+                    field.request_focus();
+                }
+                ui.horizontal(|ui| {
+                    let enter = field.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+                    if (ui.add(theme::primary_button("", "Use it")).clicked() || enter) && !typed.is_empty() {
+                        asking.deriving = Some(derive(std::mem::take(&mut **typed), ui.ctx().clone()));
+                        self.error.clear();
+                    }
+                    cancel = ui.button("Cancel").clicked();
+                });
+                ui.label(theme::small("Your master password is used for this once and forgotten."));
+                return;
+            }
+            match &asking.code {
+                None => {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("Open Rune on your phone to approve.");
+                    });
+                }
+                Some(code) => {
+                    let spaced = format!("{} {}", &code[..3], &code[3..]);
+                    ui.label(if asking.ready { "Does your phone show this code?" } else { "Approve on your phone. It shows this code:" });
+                    ui.label(RichText::new(spaced).monospace().size(28.0).color(theme::ACCENT));
+                    if asking.ready
+                        && let Some(request) = &asking.request
+                        && ui.add(theme::primary_button(icon::CHECK, "Yes, send")).clicked()
+                    {
+                        request.send();
+                        asking.ready = false;
+                    }
+                }
+            }
+            ui.horizontal_wrapped(|ui| {
+                cancel = ui.button("Cancel").clicked();
+                if ui.button("Use master password instead").clicked() {
+                    asking.typed = Some(Zeroizing::default());
+                }
+            });
+        });
+        if cancel {
+            self.asking = None;
+        }
     }
 
     // ---- Editor ------------------------------------------------------------------------------
@@ -920,17 +1078,27 @@ impl App {
         Ok(format!("Exported {} sites to {}.", self.sites.sites.len(), path.display()))
     }
 
-    /// A Rune site list, or a Bitwarden export.
+    /// A Rune site list, or a Bitwarden export: that one goes to the phone to seal (SPEC §3.4).
     fn import_sites(&mut self, path: &Path) -> Result<String, String> {
         // A file that can't be read is left for `SiteList::load` below to explain.
-        if let (Ok(mut text), Some(keys)) = (std::fs::read_to_string(path), &self.keys) {
-            let mut sealer = seal_key(&keys.master);
-            let converted = bitwarden::convert(&text, &sealer, store::nonce);
-            sealer.zeroize();
+        if let Ok(mut text) = std::fs::read_to_string(path) {
+            let converted = bitwarden::convert(&text);
             // A Bitwarden export is every password in plain text.
             text.zeroize();
             if let Some(converted) = converted? {
-                return self.import_bitwarden(converted);
+                let skipped: Vec<String> = [
+                    (converted.duplicates, "listed twice"),
+                    (converted.no_password, "without a password"),
+                    (converted.not_logins, "not logins (notes, cards, identities)"),
+                ]
+                .iter()
+                .filter(|(n, _)| *n > 0)
+                .map(|(n, why)| format!("{n} {why}"))
+                .collect();
+                let skipped = if skipped.is_empty() { String::new() } else { format!(" Skipped: {}.", skipped.join(", ")) };
+                let count = converted.items.len();
+                self.ask(Purpose::Import { items: converted.items, skipped });
+                return Ok(format!("{count} logins from Bitwarden, to be sealed by your phone."));
             }
         }
 
@@ -941,38 +1109,6 @@ impl App {
         self.sites = updated;
         self.select(None);
         Ok(format!("Imported: {added} new, {replaced} updated."))
-    }
-
-    /// Adds what isn't in Rune yet. An account already here is left alone: it may have been
-    /// switched to Rune's password since, and the export's would undo that.
-    fn import_bitwarden(&mut self, converted: bitwarden::Converted) -> Result<String, String> {
-        let mut updated = self.sites.clone();
-        let (mut added, mut already) = (0, 0);
-        for site in converted.sites {
-            match updated.put(site, None, store::now()) {
-                Ok(()) => added += 1,
-                Err(_) => already += 1,
-            }
-        }
-        updated.save(&self.sites_path)?;
-        self.sites = updated;
-        self.select(None);
-
-        let skipped: Vec<String> = [
-            (already, "already in Rune"),
-            (converted.duplicates, "listed twice"),
-            (converted.no_password, "without a password"),
-            (converted.not_logins, "not logins (notes, cards, identities)"),
-        ]
-        .iter()
-        .filter(|(n, _)| *n > 0)
-        .map(|(n, why)| format!("{n} {why}"))
-        .collect();
-        let skipped = if skipped.is_empty() { String::new() } else { format!(" Skipped: {}.", skipped.join(", ")) };
-        Ok(format!(
-            "Imported {added} from Bitwarden, each keeping its password until you switch it to Rune's.{skipped} \
-             Now delete the export file: it holds your passwords in plain text."
-        ))
     }
 
     fn settings_screen(&mut self, ui: &mut Ui) -> Option<Screen> {
@@ -1014,6 +1150,7 @@ impl App {
         }
 
         let sync_note = self.sync_note();
+        let mut importing = false;
         let Screen::Settings(settings) = &mut self.screen else {
             return None;
         };
@@ -1063,6 +1200,7 @@ impl App {
             if !settings.message.is_empty() {
                 theme::note(ui, icon::CHECK_CIRCLE, &settings.message, theme::ACCENT);
             }
+            importing = self.asking.as_ref().is_some_and(|a| matches!(a.purpose, Purpose::Import { .. }));
         });
 
         theme::card().show(ui, |ui| {
@@ -1070,7 +1208,7 @@ impl App {
             ui.label(RichText::new("Reset").strong());
             ui.label(theme::small(
                 "Removes your keys from this computer. Your site list stays. To use Rune again here \
-                 you need your master password. Rune locks itself after 5 idle minutes.",
+                 you need your master password.",
             ));
             ui.horizontal(|ui| {
                 if !settings.confirm_reset {
@@ -1082,7 +1220,8 @@ impl App {
                         match store::delete_keys(store::ACCOUNT) {
                             Ok(()) => {
                                 self.stored = None;
-                                self.keys = None;
+                                self.revealed = None;
+                                self.asking = None;
                                 next = Some(Screen::Setup);
                             }
                             Err(e) => self.error = format!("Can't reach the system keyring: {e}"),
@@ -1094,6 +1233,14 @@ impl App {
                 }
             });
         });
+
+        if importing {
+            theme::card().show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(RichText::new("Seal the imported passwords").strong());
+                self.asking_panel(ui);
+            });
+        }
 
         ui.label(theme::small(format!(
             "Rune {}  ·  {}",
@@ -1175,6 +1322,7 @@ impl App {
             self.active_at = SystemTime::now();
         }
         self.sync_with_phone(ui.ctx());
+        self.poll_asking(ui.ctx());
         let frame = egui::Frame::new().fill(theme::BG).inner_margin(egui::Margin::same(20));
         egui::CentralPanel::default().frame(frame).show(ui, |ui| {
             // Keep a readable measure on wide windows.
@@ -1209,27 +1357,14 @@ impl App {
         let next = egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
             let next = match &self.screen {
                 Screen::Setup => self.setup_screen(ui),
-                Screen::Unlock => self.unlock_screen(ui),
-                &Screen::Deriving { ref rx, unlocking } => {
+                Screen::Deriving { rx } => {
                     let received = rx.try_recv().ok();
                     ui.add_space(ui.available_height() * 0.35);
                     ui.vertical_centered(|ui| {
                         ui.spinner();
-                        ui.label(theme::muted(if unlocking { "Unlocking…" } else { "Deriving your key…" }));
+                        ui.label(theme::muted("Deriving your key…"));
                     });
-                    match received {
-                        Some(keys) if !unlocking => Some(Screen::Confirm { keys }),
-                        Some(keys) if self.stored.as_ref().is_some_and(|s| s.fingerprint == fingerprint(&keys.master)) => {
-                            self.keys = Some(keys);
-                            self.active_at = SystemTime::now();
-                            Some(self.go_to_sites())
-                        }
-                        Some(_) => {
-                            self.error = "That isn't your master password.".to_string();
-                            Some(Screen::Unlock)
-                        }
-                        None => None,
-                    }
+                    received.map(|keys| Screen::Confirm { keys })
                 }
                 Screen::Confirm { .. } => self.confirm_screen(ui),
                 Screen::Sites => unreachable!("drawn above"),
@@ -1252,6 +1387,43 @@ impl App {
             self.screen = screen;
         }
     }
+}
+
+/// What the phone would reveal for `site` (SPEC §3.4 `show`).
+fn reveal(master: &rune_core::Key, site: &Site) -> Result<Revealed, String> {
+    let make = |counter| password(&site_key(master, &site.site, &site.login, counter), site.length, &site.classes, &site.symbols);
+    let mut sealer = seal_key(master);
+    let kept = (!site.sealed.is_empty()).then(|| open(&sealer, &site.sealed)).transpose();
+    sealer.zeroize();
+    Ok(Revealed {
+        password: make(site.counter).map_err(|e| format!("this site's settings are invalid: {e}"))?,
+        previous: (site.counter > 1).then(|| make(site.counter - 1).ok()).flatten(),
+        kept: kept?,
+    })
+}
+
+/// What the phone does for `keep` (`replace`: an existing entry gets the password) and `import`
+/// (new entries only), done here and saved (SPEC §3.4).
+fn keep_here(sites: &mut SiteList, path: &Path, master: &rune_core::Key, items: &[ToKeep], replace: bool) -> Result<Approval, String> {
+    let mut sealer = seal_key(master);
+    let mut updated = sites.clone();
+    let (mut added, mut already) = (0, 0);
+    for item in items {
+        let site = Site { sealed: seal(&sealer, &item.password, store::nonce()), ..item.site.clone() };
+        let index = updated.sites.iter().position(|s| s.site == site.site && s.login == site.login);
+        let result = match index {
+            Some(i) if replace => updated.put(site, Some(i), store::now()),
+            _ => updated.put(site, None, store::now()),
+        };
+        match result {
+            Ok(()) => added += 1,
+            Err(_) => already += 1,
+        }
+    }
+    sealer.zeroize();
+    updated.save(path)?;
+    *sites = updated;
+    Ok(Approval::Done { added, already })
 }
 
 /// The master key from `password`, on its own thread: Argon2id takes about a second.
@@ -1416,7 +1588,7 @@ fn open_dialog(kind: Dialog, ctx: egui::Context) -> Receiver<Option<PathBuf>> {
 
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.lock_when_idle(ctx);
+        self.forget_when_idle(ctx);
     }
 
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {

@@ -1,9 +1,9 @@
 //! Moving in from Bitwarden: its unencrypted JSON export becomes Rune sites that keep their
 //! existing passwords (SPEC §3.1) until each is changed to Rune's.
 
-use rune_core::{DEFAULT_LENGTH, DEFAULT_SYMBOLS, Key, Site, normalize, seal};
+use rune_core::{DEFAULT_LENGTH, DEFAULT_SYMBOLS, Site, ToKeep, normalize};
 use serde::Deserialize;
-use zeroize::Zeroize;
+use zeroize::Zeroizing;
 
 #[derive(Deserialize)]
 struct Export {
@@ -36,9 +36,9 @@ struct Uri {
 const LOGIN: u8 = 1;
 
 pub struct Converted {
-    /// One per account, each with its password sealed. Not yet stamped or checked against the
-    /// list they are going into.
-    pub sites: Vec<Site>,
+    /// One per account, with its password for the phone to seal (SPEC §3.4). Not yet stamped
+    /// or checked against the list they are going into.
+    pub items: Vec<ToKeep>,
     pub not_logins: usize,
     pub no_password: usize,
     pub duplicates: usize,
@@ -49,9 +49,9 @@ pub struct Converted {
 ///
 /// Taken from each login: its first web address as the site (or its name, for an app or an
 /// entry with no address), any `androidapp://` addresses as linked apps, the username, and the
-/// password, sealed. Left behind on purpose: notes (they can hold secrets, and the site list
+/// password. Left behind on purpose: notes (they can hold secrets, and the site list
 /// isn't encrypted), TOTP seeds, cards and identities.
-pub fn convert(text: &str, seal_key: &Key, mut nonce: impl FnMut() -> [u8; 12]) -> Result<Option<Converted>, String> {
+pub fn convert(text: &str) -> Result<Option<Converted>, String> {
     let Ok(export) = serde_json::from_str::<Export>(text) else {
         return Ok(None);
     };
@@ -59,13 +59,13 @@ pub fn convert(text: &str, seal_key: &Key, mut nonce: impl FnMut() -> [u8; 12]) 
         return Err("That Bitwarden export is encrypted. Export again and choose the format \".json\", not \".json (Encrypted)\".".to_string());
     }
 
-    let mut converted = Converted { sites: vec![], not_logins: 0, no_password: 0, duplicates: 0 };
+    let mut converted = Converted { items: vec![], not_logins: 0, no_password: 0, duplicates: 0 };
     for item in export.items {
         let Some(login) = item.login.filter(|_| item.kind == LOGIN) else {
             converted.not_logins += 1;
             continue;
         };
-        let Some(mut password) = login.password.filter(|p| !p.is_empty()) else {
+        let Some(password) = login.password.filter(|p| !p.is_empty()) else {
             converted.no_password += 1;
             continue;
         };
@@ -77,10 +77,11 @@ pub fn convert(text: &str, seal_key: &Key, mut nonce: impl FnMut() -> [u8; 12]) 
         let site = host.unwrap_or_else(|| normalize(item.name.as_deref().unwrap_or_default()));
         let username = normalize(login.username.as_deref().unwrap_or_default());
 
-        if site.is_empty() || converted.sites.iter().any(|s| s.site == site && s.login == username) {
+        if site.is_empty() || converted.items.iter().any(|i| i.site.site == site && i.site.login == username) {
             converted.duplicates += 1;
+            drop(Zeroizing::new(password));
         } else {
-            converted.sites.push(Site {
+            let site = Site {
                 site,
                 login: username,
                 counter: 1,
@@ -89,11 +90,11 @@ pub fn convert(text: &str, seal_key: &Key, mut nonce: impl FnMut() -> [u8; 12]) 
                 symbols: DEFAULT_SYMBOLS.to_string(),
                 apps,
                 note: String::new(),
-                sealed: seal(seal_key, &password, nonce()),
+                sealed: String::new(),
                 modified: 0,
-            });
+            };
+            converted.items.push(ToKeep { site, password });
         }
-        password.zeroize();
     }
     Ok(Some(converted))
 }

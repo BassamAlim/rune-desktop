@@ -7,11 +7,11 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use arboard::{Clipboard, SetExtLinux};
 use eframe::egui;
-use rune_core::{Key, SiteList};
+use rune_core::{ANSWER_AAD, Frame, Key, REQUEST_AAD, Revealed, SiteList, ToKeep};
 use zeroize::Zeroize;
 
 const SERVICE: &str = "rune";
@@ -95,11 +95,91 @@ pub const SYNC_PORT: u16 = 47825;
 const SYNC_PROBE: &str = "rune-sync/1";
 const SYNC_MAX_BYTES: u32 = 4 * 1024 * 1024;
 
+/// How long a request waits for the phone (SPEC §3.4).
+pub const ASK_FOR: Duration = Duration::from_secs(120);
+
 /// Answering phones for as long as it lives. `synced` gets a message after each exchange:
 /// whether the site list on disk changed.
 pub struct SyncListener {
     pub synced: Receiver<bool>,
     stop: Arc<AtomicBool>,
+    waiting: Waiting,
+}
+
+/// §3.4: what the window asks the phone for.
+pub enum Ask {
+    Show { site: String, login: String },
+    Keep(Vec<ToKeep>),
+    Import(Vec<ToKeep>),
+}
+
+/// How a request goes, as it happens.
+#[derive(Debug, PartialEq)]
+pub enum Approval {
+    /// Both sides have the code; the phone is asking its user.
+    Code(String),
+    Revealed(Revealed),
+    /// The phone doesn't have that site.
+    Missing,
+    Declined,
+    /// `keep` / `import`: the phone approved; the passwords go once the user confirms the code
+    /// with [`Request::send`].
+    Ready,
+    Done { added: usize, already: usize },
+    Failed(String),
+}
+
+/// A request waiting for, or talking to, the phone. Dropping it cancels a request that hasn't
+/// reached the phone yet.
+pub struct Request {
+    pub events: Receiver<Approval>,
+    confirm: mpsc::Sender<()>,
+    waiting: Waiting,
+    id: String,
+}
+
+impl Request {
+    /// `keep` / `import`: the codes match, send the passwords.
+    pub fn send(&self) {
+        let _ = self.confirm.send(());
+    }
+}
+
+impl Drop for Request {
+    fn drop(&mut self) {
+        let mut waiting = self.waiting.lock().unwrap();
+        if waiting.as_ref().is_some_and(|w| w.id == self.id) {
+            *waiting = None;
+        }
+    }
+}
+
+struct Pending {
+    id: String,
+    ask: Ask,
+    events: mpsc::Sender<Approval>,
+    confirm: Receiver<()>,
+    until: Instant,
+}
+
+/// The one request waiting for the phone, shared with the threads that answer it.
+type Waiting = Arc<Mutex<Option<Pending>>>;
+
+impl SyncListener {
+    /// Asks the phone, replacing whatever was waiting (SPEC §3.4).
+    pub fn ask(&self, ask: Ask) -> Request {
+        let (events_tx, events) = mpsc::channel();
+        let (confirm, confirm_rx) = mpsc::channel();
+        let id = hex::encode(random::<16>());
+        *self.waiting.lock().unwrap() = Some(Pending {
+            id: id.clone(),
+            ask,
+            events: events_tx,
+            confirm: confirm_rx,
+            until: Instant::now() + ASK_FOR,
+        });
+        Request { events, confirm, waiting: self.waiting.clone(), id }
+    }
 }
 
 impl Drop for SyncListener {
@@ -131,45 +211,46 @@ pub fn listen_for_sync(
     tcp.set_nonblocking(true)?;
     let stop = Arc::new(AtomicBool::new(false));
     let (synced_tx, synced) = mpsc::channel();
+    let waiting: Waiting = Arc::default();
 
-    // Found only by a phone that already knows this key's fingerprint.
+    // Found only by a phone that already knows this key's fingerprint. " ask" tells it a
+    // request is waiting (§3.4).
     let probe = format!("{SYNC_PROBE} {fingerprint}").into_bytes();
     let stopped = stop.clone();
+    let asking = waiting.clone();
     std::thread::spawn(move || {
         let mut buffer = [0u8; 64];
         while !stopped.load(Ordering::Relaxed) {
             if let Ok((n, from)) = udp.recv_from(&mut buffer)
                 && buffer[..n] == probe[..]
             {
-                let _ = udp.send_to(&probe, from);
+                let ask = asking.lock().unwrap().as_ref().is_some_and(|w| w.until > Instant::now());
+                let answer = if ask { [&probe[..], b" ask"].concat() } else { probe.clone() };
+                let _ = udp.send_to(&answer, from);
             }
         }
     });
 
     let stopped = stop.clone();
+    let asking = waiting.clone();
     std::thread::spawn(move || {
         while !stopped.load(Ordering::Relaxed) {
             match tcp.accept() {
-                Ok((stream, _)) => {
-                    if let Some(changed) = answer_sync(stream, &sync_key, &sites_path) {
+                Ok((mut stream, _)) => {
+                    if let Some(changed) = answer_sync(&mut stream, &sync_key, &sites_path) {
                         let _ = synced_tx.send(changed);
                         wake();
+                        hand_over(&mut stream, &sync_key, &asking);
                     }
                 }
                 Err(_) => std::thread::sleep(Duration::from_millis(200)),
             }
         }
     });
-    Ok(SyncListener { synced, stop })
+    Ok(SyncListener { synced, stop, waiting })
 }
 
-/// One exchange: a length and that many sealed bytes each way. `None` for anything that isn't
-/// a phone with this master password, or when the list can't be read or saved: no answer then.
-fn answer_sync(mut stream: TcpStream, sync_key: &Key, sites_path: &std::path::Path) -> Option<bool> {
-    stream.set_nonblocking(false).ok()?;
-    stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
-    stream.set_write_timeout(Some(Duration::from_secs(5))).ok()?;
-
+fn read_frame(stream: &mut TcpStream) -> Option<Vec<u8>> {
     let mut length = [0u8; 4];
     stream.read_exact(&mut length).ok()?;
     let length = u32::from_be_bytes(length);
@@ -178,6 +259,107 @@ fn answer_sync(mut stream: TcpStream, sync_key: &Key, sites_path: &std::path::Pa
     }
     let mut message = vec![0u8; length as usize];
     stream.read_exact(&mut message).ok()?;
+    Some(message)
+}
+
+fn write_frame(stream: &mut TcpStream, message: &[u8]) -> Option<()> {
+    stream.write_all(&(message.len() as u32).to_be_bytes()).ok()?;
+    stream.write_all(message).ok()
+}
+
+/// §3.4, after a sync: the waiting request, or `{}`, then the exchange that answers it.
+fn hand_over(stream: &mut TcpStream, sync_key: &Key, waiting: &Waiting) {
+    let pending = waiting.lock().unwrap().take().filter(|p| p.until > Instant::now());
+    let Some(pending) = pending else {
+        let _ = write_frame(stream, &rune_core::frame_seal(sync_key, REQUEST_AAD, &Frame::default(), nonce()));
+        return;
+    };
+    let mut private = random::<32>();
+    let result = approve(stream, sync_key, &pending, &private);
+    private.zeroize();
+    match result {
+        Ok(()) => {}
+        // A phone that doesn't know requests closes here: the request keeps waiting for one that does.
+        Err(None) => {
+            let mut waiting = waiting.lock().unwrap();
+            if waiting.is_none() {
+                *waiting = Some(pending);
+            }
+        }
+        Err(Some(e)) => {
+            let _ = pending.events.send(Approval::Failed(e));
+        }
+    }
+}
+
+/// `Err(None)` when the phone never took the request up; `Err(Some(why))` when it broke off after.
+fn approve(stream: &mut TcpStream, sync_key: &Key, pending: &Pending, private: &Key) -> Result<(), Option<String>> {
+    let id = &pending.id;
+    let desktop_pub = rune_core::x25519_public(private);
+    let send = |stream: &mut TcpStream, frame: Frame| {
+        write_frame(stream, &rune_core::frame_seal(sync_key, REQUEST_AAD, &frame, nonce()))
+            .ok_or_else(|| "the phone stopped answering".to_string())
+    };
+    let receive = |stream: &mut TcpStream| -> Result<Frame, String> {
+        let left = pending.until.saturating_duration_since(Instant::now()).max(Duration::from_millis(1));
+        stream.set_read_timeout(Some(left)).map_err(|e| e.to_string())?;
+        let frame = read_frame(stream).ok_or("the phone didn't answer in time")?;
+        let frame = rune_core::frame_open(sync_key, ANSWER_AAD, &frame)?;
+        if &frame.id != id {
+            return Err("the phone answered another request".into());
+        }
+        Ok(frame)
+    };
+    let (kind, site, login, count) = match &pending.ask {
+        Ask::Show { site, login } => ("show", Some(site.clone()), Some(login.clone()), None),
+        Ask::Keep(items) => ("keep", None, None, Some(items.len())),
+        Ask::Import(items) => ("import", None, None, Some(items.len())),
+    };
+    let commit = hex::encode(rune_core::approval_commit(&desktop_pub));
+    send(stream, Frame { id: id.clone(), kind: kind.into(), site, login, count, commit, ..Default::default() }).map_err(|_| None)?;
+    let first = receive(stream).map_err(|_| None)?;
+
+    let fail = |e: String| Some(e);
+    if first.declined {
+        let _ = pending.events.send(Approval::Declined);
+        return Ok(());
+    }
+    let phone_pub: Key = hex::decode(&first.public).ok().and_then(|b| b.try_into().ok()).ok_or_else(|| fail("the phone's key is damaged".into()))?;
+    send(stream, Frame { id: id.clone(), public: hex::encode(desktop_pub), ..Default::default() }).map_err(fail)?;
+    let mut key = rune_core::answer_key(private, &phone_pub, &desktop_pub, &phone_pub).ok_or_else(|| fail("the phone's key is unsafe".into()))?;
+    let _ = pending.events.send(Approval::Code(rune_core::approval_code(&desktop_pub, &phone_pub)));
+
+    let result = (|| {
+        let answer = receive(stream)?;
+        let event = match (&pending.ask, answer) {
+            (_, a) if a.declined => Approval::Declined,
+            (Ask::Show { .. }, a) if a.missing => Approval::Missing,
+            (Ask::Show { .. }, a) => Approval::Revealed(rune_core::box_open(&key, &a.sealed)?),
+            (Ask::Keep(items) | Ask::Import(items), a) if a.ready => {
+                let _ = pending.events.send(Approval::Ready);
+                let left = pending.until.saturating_duration_since(Instant::now());
+                pending.confirm.recv_timeout(left).map_err(|_| "the code wasn't confirmed in time".to_string())?;
+                send(stream, Frame { id: id.clone(), sealed: rune_core::box_seal(&key, items, nonce()), ..Default::default() })?;
+                let done = receive(stream)?;
+                Approval::Done { added: done.added.unwrap_or(0), already: done.already.unwrap_or(0) }
+            }
+            _ => return Err("the phone's answer makes no sense".to_string()),
+        };
+        let _ = pending.events.send(event);
+        Ok(())
+    })();
+    key.zeroize();
+    result.map_err(fail)
+}
+
+/// One exchange: a length and that many sealed bytes each way. `None` for anything that isn't
+/// a phone with this master password, or when the list can't be read or saved: no answer then.
+fn answer_sync(stream: &mut TcpStream, sync_key: &Key, sites_path: &std::path::Path) -> Option<bool> {
+    stream.set_nonblocking(false).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
+    stream.set_write_timeout(Some(Duration::from_secs(5))).ok()?;
+
+    let message = read_frame(stream)?;
     let theirs = rune_core::sync_open(sync_key, &message).ok()?;
 
     let mine = SiteList::load(sites_path).ok()?;
@@ -188,9 +370,7 @@ fn answer_sync(mut stream: TcpStream, sync_key: &Key, sites_path: &std::path::Pa
         merged.save(sites_path).ok()?;
     }
 
-    let answer = rune_core::sync_seal(sync_key, &merged, nonce());
-    stream.write_all(&(answer.len() as u32).to_be_bytes()).ok()?;
-    stream.write_all(&answer).ok()?;
+    write_frame(stream, &rune_core::sync_seal(sync_key, &merged, nonce()))?;
     Some(changed)
 }
 
@@ -201,7 +381,12 @@ pub fn now() -> u64 {
 
 /// A fresh nonce for sealing a password (§3.1). Never reused: it comes from the kernel's RNG.
 pub fn nonce() -> [u8; 12] {
-    let mut bytes = [0u8; 12];
+    random()
+}
+
+/// Bytes from the kernel's RNG.
+pub fn random<const N: usize>() -> [u8; N] {
+    let mut bytes = [0u8; N];
     std::fs::File::open("/dev/urandom")
         .and_then(|mut f| f.read_exact(&mut bytes))
         .expect("/dev/urandom is readable");

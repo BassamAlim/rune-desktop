@@ -13,12 +13,14 @@ fn temp_dir(name: &str) -> PathBuf {
     dir
 }
 
-/// Set up and unlocked.
 fn app_with_keys(sites_path: PathBuf) -> App {
-    let mut app = App::start(sites_path, Ok(Some(Stored::from_master(&MASTER))));
-    app.keys = Some(Keys { master: MASTER });
-    app.screen = Screen::Sites;
-    app
+    App::start(sites_path, Ok(Some(Stored::from_master(&MASTER))))
+}
+
+/// Answers what the app is asking as the phone would, for a phone holding `MASTER`.
+fn answer(app: &mut App) {
+    let outcome = app.answer_here(&MASTER);
+    app.finish(outcome);
 }
 
 fn harness(app: App, builder: egui_kittest::HarnessBuilder<App>) -> Harness<'static, App> {
@@ -35,7 +37,8 @@ fn harness(app: App, builder: egui_kittest::HarnessBuilder<App>) -> Harness<'sta
         },
         app,
     );
-    harness.run();
+    // A request to the phone polls for its answer, so that screen never settles.
+    let _ = harness.try_run();
     harness
 }
 
@@ -106,6 +109,11 @@ fn add_show_and_delete_a_site() {
 
     let pw = password(&site_key(&MASTER, "github.com", "bassam", 1), DEFAULT_LENGTH, "luds", DEFAULT_SYMBOLS).unwrap();
     assert!(harness.query_by_label(&pw).is_none(), "password must be hidden until shown");
+    click(&mut harness, "Show password");
+    assert!(harness.state().asking.is_some(), "asked for, not derived here");
+    answer(harness.state_mut());
+    harness.run();
+    assert!(harness.query_by_label(&pw).is_none(), "revealed, but still masked");
     click(&mut harness, "Show password");
     harness.get_by_label(&pw);
     assert!(harness.query_by_label("Copy previous password").is_none(), "counter 1 has no previous");
@@ -213,10 +221,11 @@ fn setup_checks_the_typed_back_words() {
     assert!(matches!(harness.state().screen, Screen::Deriving { .. }));
 }
 
-/// Steps until Argon2 is done: the spinner never lets the harness settle.
-fn wait_for_derive(harness: &mut Harness<'_, App>) {
+/// Steps until `asking` settles: the spinner never lets the harness settle on its own.
+fn wait_for_answer(harness: &mut Harness<'_, App>) {
     for _ in 0..200 {
-        if !matches!(harness.state().screen, Screen::Deriving { .. }) {
+        if harness.state().asking.as_ref().is_none_or(|a| a.deriving.is_none()) {
+            harness.run();
             return;
         }
         std::thread::sleep(Duration::from_millis(50));
@@ -226,49 +235,50 @@ fn wait_for_derive(harness: &mut Harness<'_, App>) {
 }
 
 #[test]
-fn unlock_takes_only_the_master_password() {
-    let stored = Stored::from_master(&master_key("correct horse"));
-    let mut harness = harness(App::start(temp_dir("unlock").join("sites.json"), Ok(Some(stored))), Harness::builder());
-    assert!(matches!(harness.state().screen, Screen::Unlock));
-    assert!(harness.state().keys.is_none(), "the master key isn't stored");
+fn the_master_password_answers_without_the_phone() {
+    let master = master_key("correct horse");
+    let mut app = App::start(temp_dir("fallback").join("sites.json"), Ok(Some(Stored::from_master(&master))));
+    app.sites.sites = vec![site("github.com", "")];
+    app.selected = Some(0);
+    let mut harness = harness(app, Harness::builder());
+    assert!(matches!(harness.state().screen, Screen::Sites), "no lock: the list holds no secrets");
 
-    harness.get_by_role(Role::PasswordInput).type_text("wrong horse");
-    harness.run();
-    button(&harness, "Unlock").click();
-    harness.step();
-    wait_for_derive(&mut harness);
-    assert!(matches!(harness.state().screen, Screen::Unlock));
-    assert_eq!(harness.state().error, "That isn't your master password.");
-    harness.run();
-    harness.get_by_role(Role::PasswordInput).type_text("correct horse");
-    harness.run();
-    button(&harness, "Unlock").click();
-    harness.step();
-    wait_for_derive(&mut harness);
-    assert!(matches!(harness.state().screen, Screen::Sites));
-    assert_eq!(harness.state().keys.as_ref().unwrap().master, master_key("correct horse"));
-    assert!(harness.state().error.is_empty());
+    // Not listening for the phone (as in tests), so the master password is asked for at once.
+    click(&mut harness, "Show password");
+    for (typed, error) in [("wrong horse", "That isn't your master password."), ("correct horse", "")] {
+        harness.get_by_role(Role::PasswordInput).type_text(typed);
+        harness.run();
+        button(&harness, "Use it").click();
+        harness.step();
+        wait_for_answer(&mut harness);
+        assert_eq!(harness.state().error, error);
+    }
+    let expected = reveal(&master, &site("github.com", "")).unwrap();
+    assert_eq!(harness.state().revealed.as_ref().unwrap().2, expected);
+    assert!(harness.state().asking.is_none());
 }
 
 #[test]
-fn locks_when_idle_or_asked() {
-    let mut app = app_with_keys(temp_dir("lock").join("sites.json"));
-    app.sites.sites = vec![site("github.com", "")];
-    app.selected = Some(0);
+fn forgets_what_was_revealed() {
+    let mut app = app_with_keys(temp_dir("forget").join("sites.json"));
+    app.sites.sites = vec![site("github.com", ""), site("b.example", "")];
+    app.select(Some(0));
+    app.ask(Purpose::Show { site: "github.com".into(), login: "".into() });
+    answer(&mut app);
     app.show_password = true;
     let ctx = egui::Context::default();
-    app.lock_when_idle(&ctx);
-    assert!(app.keys.is_some(), "not idle yet");
-    app.active_at = SystemTime::now() - LOCK_AFTER;
-    app.lock_when_idle(&ctx);
-    assert!(app.keys.is_none() && app.selected.is_none() && !app.show_password);
-    assert!(matches!(app.screen, Screen::Unlock));
+    app.forget_when_idle(&ctx);
+    assert!(app.revealed.is_some(), "not idle yet");
+    app.select(Some(0));
+    assert!(app.revealed.is_some(), "re-selecting the same site keeps it");
+    app.active_at = SystemTime::now() - FORGET_AFTER;
+    app.forget_when_idle(&ctx);
+    assert!(app.revealed.is_none() && !app.show_password);
 
-    let mut harness = harness(app_with_keys(temp_dir("lock-button").join("sites.json")), Harness::builder());
-    harness.get_by_label("Lock").click();
-    harness.run();
-    assert!(harness.state().keys.is_none());
-    assert!(matches!(harness.state().screen, Screen::Unlock));
+    app.ask(Purpose::Show { site: "github.com".into(), login: "".into() });
+    answer(&mut app);
+    app.select(Some(1));
+    assert!(app.revealed.is_none(), "another site forgets it");
 }
 
 #[test]
@@ -300,16 +310,21 @@ fn an_old_password_is_kept_sealed_until_switched() {
     harness.run();
     harness.get_by_label_contains("Keep it").click();
     harness.run();
+    assert!(matches!(harness.state().asking.as_ref().unwrap().purpose, Purpose::Keep(_)));
+    answer(harness.state_mut());
+    harness.run();
 
     let sealed = harness.state().sites.sites[0].sealed.clone();
     assert!(!sealed.is_empty() && !sealed.contains("Hunter2"));
     assert_eq!(rune_core::open(&rune_core::seal_key(&MASTER), &sealed).unwrap(), "Hunter2!");
     assert_eq!(SiteList::load(&path).unwrap().sites[0].sealed, sealed, "saved, not just shown");
 
-    harness.get_by_label_contains("Switch to Rune's password").click();
+    click(&mut harness, "Show password");
+    answer(harness.state_mut());
     harness.run();
-    harness.get_by_label("Yes, I've changed it").click();
-    harness.run();
+    assert_eq!(harness.state().revealed.as_ref().unwrap().2.kept.as_deref(), Some("Hunter2!"));
+    click(&mut harness, "Switch to Rune's password");
+    click(&mut harness, "Yes, I've changed it");
     assert_eq!(harness.state().sites.sites[0].sealed, "");
 }
 
@@ -362,6 +377,129 @@ fn a_phone_with_the_same_master_syncs_over_the_network() {
     assert_eq!(listener.synced.recv_timeout(Duration::from_secs(1)), Ok(false), "a second sync changes nothing");
 }
 
+/// Plays the phone's side of SPEC §3.4 on one connection, after an empty sync.
+struct Phone {
+    stream: std::net::TcpStream,
+    key: rune_core::Key,
+}
+
+impl Phone {
+    fn connect(port: u16, key: rune_core::Key) -> Self {
+        let mut phone = Phone { stream: std::net::TcpStream::connect(("127.0.0.1", port)).unwrap(), key };
+        phone.stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let empty = SiteList { version: 1, sites: vec![], deleted: vec![] };
+        phone.write(&rune_core::sync_seal(&key, &empty, [3; 12]));
+        rune_core::sync_open(&key, &phone.read()).unwrap();
+        phone
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        use std::io::Write;
+        self.stream.write_all(&(bytes.len() as u32).to_be_bytes()).unwrap();
+        self.stream.write_all(bytes).unwrap();
+    }
+
+    fn read(&mut self) -> Vec<u8> {
+        use std::io::Read;
+        let mut length = [0u8; 4];
+        self.stream.read_exact(&mut length).unwrap();
+        let mut bytes = vec![0u8; u32::from_be_bytes(length) as usize];
+        self.stream.read_exact(&mut bytes).unwrap();
+        bytes
+    }
+
+    fn request(&mut self) -> rune_core::Frame {
+        let bytes = self.read();
+        rune_core::frame_open(&self.key, rune_core::REQUEST_AAD, &bytes).unwrap()
+    }
+
+    fn answer(&mut self, frame: rune_core::Frame) {
+        let bytes = rune_core::frame_seal(&self.key, rune_core::ANSWER_AAD, &frame, store::nonce());
+        self.write(&bytes);
+    }
+
+    /// Steps 3 and 4: takes the request, agrees a code; returns it with the answer key.
+    fn agree(&mut self) -> (rune_core::Frame, String, rune_core::Key) {
+        let request = self.request();
+        let private = [2; 32];
+        let phone_pub = rune_core::x25519_public(&private);
+        self.answer(rune_core::Frame { id: request.id.clone(), public: hex::encode(phone_pub), ..Default::default() });
+        let reveal = self.request();
+        let desktop_pub: rune_core::Key = hex::decode(&reveal.public).unwrap().try_into().unwrap();
+        assert_eq!(hex::encode(rune_core::approval_commit(&desktop_pub)), request.commit, "the desktop kept its commitment");
+        let code = rune_core::approval_code(&desktop_pub, &phone_pub);
+        let key = rune_core::answer_key(&private, &desktop_pub, &desktop_pub, &phone_pub).unwrap();
+        (request, code, key)
+    }
+}
+
+#[test]
+fn the_phone_approves_what_the_desktop_asks() {
+    use store::{Approval, Ask};
+    let path = temp_dir("approve").join("sites.json");
+    let key = rune_core::sync_key(&MASTER);
+    let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let listener = store::listen_for_sync(port, key, "ef15", path, || {}).unwrap();
+    let next = |request: &store::Request| request.events.recv_timeout(Duration::from_secs(5)).unwrap();
+
+    // Nothing waiting: the probe is plain, and a sync ends with `{}`.
+    let udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    udp.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+    let probe = |udp: &std::net::UdpSocket| {
+        let mut answer = [0u8; 64];
+        udp.send_to(b"rune-sync/1 ef15", ("127.0.0.1", port)).unwrap();
+        let (n, _) = udp.recv_from(&mut answer).unwrap();
+        String::from_utf8_lossy(&answer[..n]).into_owned()
+    };
+    assert_eq!(probe(&udp), "rune-sync/1 ef15");
+    assert_eq!(Phone::connect(port, key).request(), rune_core::Frame::default());
+
+    // show: the phone reveals, and only the desktop it agreed a code with can read it.
+    let request = listener.ask(Ask::Show { site: "github.com".into(), login: "".into() });
+    assert_eq!(probe(&udp), "rune-sync/1 ef15 ask");
+    let mut phone = Phone::connect(port, key);
+    let (asked, code, answer_key) = phone.agree();
+    assert_eq!((asked.kind.as_str(), asked.site.as_deref(), asked.login.as_deref()), ("show", Some("github.com"), Some("")));
+    assert_eq!(next(&request), Approval::Code(code));
+    let revealed = rune_core::Revealed { password: "pw".into(), previous: None, kept: Some("old".into()) };
+    phone.answer(rune_core::Frame { id: asked.id, sealed: rune_core::box_seal(&answer_key, &revealed, store::nonce()), ..Default::default() });
+    assert_eq!(next(&request), Approval::Revealed(revealed));
+    assert_eq!(probe(&udp), "rune-sync/1 ef15", "answered, so nothing waits");
+
+    // Declined.
+    let request = listener.ask(Ask::Show { site: "a".into(), login: "".into() });
+    let mut phone = Phone::connect(port, key);
+    let (asked, _, _) = phone.agree();
+    next(&request);
+    phone.answer(rune_core::Frame { id: asked.id, declined: true, ..Default::default() });
+    assert_eq!(next(&request), Approval::Declined);
+
+    // import: the passwords go only after the desktop confirms the code.
+    let item = rune_core::ToKeep { site: site("b.example", "me"), password: "Hunter2!".into() };
+    let request = listener.ask(Ask::Import(vec![item.clone()]));
+    let mut phone = Phone::connect(port, key);
+    let (asked, code, answer_key) = phone.agree();
+    assert_eq!((asked.kind.as_str(), asked.count), ("import", Some(1)));
+    assert_eq!(next(&request), Approval::Code(code));
+    phone.answer(rune_core::Frame { id: asked.id.clone(), ready: true, ..Default::default() });
+    assert_eq!(next(&request), Approval::Ready);
+    request.send();
+    let items: Vec<rune_core::ToKeep> = rune_core::box_open(&answer_key, &phone.request().sealed).unwrap();
+    assert_eq!(items, vec![item]);
+    phone.answer(rune_core::Frame { id: asked.id, added: Some(1), already: Some(0), ..Default::default() });
+    assert_eq!(next(&request), Approval::Done { added: 1, already: 0 });
+
+    // A phone that doesn't know requests closes after the hand-over: the request keeps waiting.
+    let request = listener.ask(Ask::Show { site: "c".into(), login: "".into() });
+    let mut old = Phone::connect(port, key);
+    old.request();
+    drop(old);
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(probe(&udp), "rune-sync/1 ef15 ask");
+    drop(request);
+    assert_eq!(probe(&udp), "rune-sync/1 ef15", "dropping a request cancels it");
+}
+
 #[test]
 fn a_bitwarden_export_comes_in_with_its_passwords_kept() {
     let dir = temp_dir("bitwarden");
@@ -390,7 +528,12 @@ fn a_bitwarden_export_comes_in_with_its_passwords_kept() {
     let path = dir.join("sites.json");
     let mut app = app_with_keys(path.clone());
     app.sites.sites = vec![site("mail.example", "me")];
-    let message = app.import_sites(&export).unwrap();
+    app.screen = Screen::Settings(Settings::default());
+    assert_eq!(app.import_sites(&export).unwrap(), "3 logins from Bitwarden, to be sealed by your phone.");
+    assert!(matches!(app.asking.as_ref().unwrap().purpose, Purpose::Import { .. }));
+    answer(&mut app);
+    let Screen::Settings(settings) = &app.screen else { unreachable!() };
+    let message = settings.message.clone();
 
     assert!(message.starts_with("Imported 2 from Bitwarden"), "{message}");
     for skipped in ["1 already in Rune", "1 listed twice", "1 without a password", "2 not logins"] {
@@ -458,16 +601,24 @@ fn screenshots() {
         let mut app = app_with_keys(dir.join("sites.json"));
         prepare(&mut app);
         let mut harness = harness(app, Harness::builder().with_pixels_per_point(1.5).wgpu());
-        harness.run();
         harness.render().unwrap().save(out.join(format!("{name}.png"))).unwrap();
     };
 
-    shoot("0-unlock", &|app| {
-        app.lock();
-        app.error = "That isn't your master password.".into();
+    shoot("4c-asking", &|app| {
+        app.sites.sites = sites.clone();
+        app.select(Some(1));
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        app.sync = store::listen_for_sync(port, [0; 32], "test", dir.join("unused.json"), || {}).ok();
+        app.ask(Purpose::Show { site: sites[1].site.clone(), login: sites[1].login.clone() });
+        app.asking.as_mut().unwrap().code = Some("437923".into());
+    });
+    shoot("4d-master", &|app| {
+        app.sites.sites = sites.clone();
+        app.select(Some(1));
+        app.ask(Purpose::Show { site: sites[1].site.clone(), login: sites[1].login.clone() });
     });
     shoot("1-setup", &|app| {
-        app.keys = None;
+        app.stored = None;
         app.screen = Screen::Setup;
         app.generated = Some("velvet orbit candle mosaic frosty lantern".into());
         app.focus_search = false;
@@ -478,13 +629,17 @@ fn screenshots() {
     shoot("3-empty", &|_| {});
     shoot("4-sites", &|app| {
         app.sites.sites = sites.clone();
-        app.selected = Some(1);
+        app.select(Some(1));
+        app.ask(Purpose::Show { site: app.sites.sites[1].site.clone(), login: app.sites.sites[1].login.clone() });
+        answer(app);
         app.show_password = true;
     });
     shoot("4b-kept", &|app| {
         app.sites.sites = sites.clone();
         app.sites.sites[1].sealed = rune_core::seal(&rune_core::seal_key(&MASTER), "Hunter2!", [0; 12]);
-        app.selected = Some(1);
+        app.select(Some(1));
+        app.ask(Purpose::Show { site: app.sites.sites[1].site.clone(), login: app.sites.sites[1].login.clone() });
+        answer(app);
         app.show_password = true;
     });
     shoot("5-editor", &|app| {
@@ -500,7 +655,7 @@ fn screenshots() {
         app.screen = Screen::Settings(Settings { message: "Imported: 2 new, 1 updated.".into(), ..Default::default() });
     });
     shoot("8-setup-own", &|app| {
-        app.keys = None;
+        app.stored = None;
         app.screen = Screen::Setup;
         app.generated = None;
         app.password = "Bassam2024!".into();
@@ -570,11 +725,12 @@ fn site_title() {
 
 #[test]
 fn hovering_an_icon_button_moves_nothing() {
-    let mut app = App::start(temp_dir("hover").join("sites.json"), Ok(Some(Stored::from_master(&MASTER))));
-    app.screen = Screen::Unlock;
+    let mut app = App::start(temp_dir("hover").join("sites.json"), Ok(None));
+    app.generated = None;
     let mut harness = harness(app, Harness::builder());
-    let before = harness.get_by_role(Role::PasswordInput).rect();
-    harness.get_by_label("Show password").hover();
+    let field = |h: &Harness<'_, App>| h.query_all_by_role(Role::PasswordInput).next().unwrap().rect();
+    let before = field(&harness);
+    harness.query_all_by_label("Show password").next().unwrap().hover();
     harness.run();
-    assert_eq!(harness.get_by_role(Role::PasswordInput).rect(), before);
+    assert_eq!(field(&harness), before);
 }

@@ -228,6 +228,144 @@ pub fn sync_open(sync_key: &Key, message: &[u8]) -> Result<SiteList, String> {
     Ok(list)
 }
 
+/// §3.4: an X25519 public key, made fresh for one approval.
+pub fn x25519_public(private: &Key) -> Key {
+    let mut base = [0u8; 32];
+    base[0] = 9;
+    x25519_dalek::x25519(*private, base)
+}
+
+/// §3.4: what the desktop sends before it shows its public key.
+pub fn approval_commit(desktop_pub: &Key) -> Key {
+    sha256(&[b"rune/v1/commit", desktop_pub])
+}
+
+/// §3.4: the six digits both screens show.
+pub fn approval_code(desktop_pub: &Key, phone_pub: &Key) -> String {
+    let h = sha256(&[b"rune/v1/code", desktop_pub, phone_pub]);
+    format!("{:06}", u32::from_be_bytes([h[0], h[1], h[2], h[3]]) % 1_000_000)
+}
+
+/// §3.4: the key for what's secret in an approval. `None` when the other side's key is one
+/// that would make the shared secret all zeros.
+pub fn answer_key(own_private: &Key, other_pub: &Key, desktop_pub: &Key, phone_pub: &Key) -> Option<Key> {
+    let mut shared = x25519_dalek::x25519(*own_private, *other_pub);
+    if shared == [0; 32] {
+        return None;
+    }
+    // HKDF-SHA256 (RFC 5869); one block is the 32 bytes wanted.
+    let prk = hmac(&[desktop_pub.as_slice(), phone_pub].concat(), &[&shared]);
+    shared.fill(0);
+    Some(hmac(&prk, &[b"rune/v1/answer", &[1]]))
+}
+
+fn sha256(parts: &[&[u8]]) -> Key {
+    use sha2::Digest;
+    let mut h = Sha256::new();
+    for p in parts {
+        h.update(p);
+    }
+    h.finalize().into()
+}
+
+pub const REQUEST_AAD: &[u8] = b"rune/v1/request";
+pub const ANSWER_AAD: &[u8] = b"rune/v1/answer";
+const BOX_AAD: &[u8] = b"rune/v1/box";
+
+/// §3.4: one frame's sealed bytes (without the length), under `sync_key`. `aad` says which side
+/// sent it: [`REQUEST_AAD`] or [`ANSWER_AAD`].
+pub fn frame_seal(sync_key: &Key, aad: &[u8], frame: &Frame, nonce: [u8; 12]) -> Vec<u8> {
+    aead_seal(sync_key, aad, &serde_json::to_vec(frame).expect("a frame is always JSON"), nonce)
+}
+
+pub fn frame_open(sync_key: &Key, aad: &[u8], bytes: &[u8]) -> Result<Frame, String> {
+    let json = aead_open(sync_key, aad, bytes).ok_or("not from a device with this master password")?;
+    serde_json::from_slice(&json).map_err(|e| e.to_string())
+}
+
+/// §3.4: a secret inside a frame, under `answer_key`, as hex.
+pub fn box_seal<T: Serialize>(answer_key: &Key, value: &T, nonce: [u8; 12]) -> String {
+    let mut json = serde_json::to_vec(value).expect("always JSON");
+    let sealed = hex::encode(aead_seal(answer_key, BOX_AAD, &json, nonce));
+    json.fill(0);
+    sealed
+}
+
+pub fn box_open<T: serde::de::DeserializeOwned>(answer_key: &Key, sealed: &str) -> Result<T, String> {
+    let bytes = hex::decode(sealed).map_err(|_| "not a box".to_string())?;
+    let mut json = aead_open(answer_key, BOX_AAD, &bytes).ok_or("the box doesn't open with this key")?;
+    let value = serde_json::from_slice(&json).map_err(|e| e.to_string());
+    json.fill(0);
+    value
+}
+
+/// §3.4: every frame of an approval, either way. Fields a frame doesn't use are left out.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Frame {
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub id: String,
+    /// "show", "keep" or "import".
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub site: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub login: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub count: Option<usize>,
+    /// Hex, like `pub`.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub commit: String,
+    #[serde(rename = "pub", skip_serializing_if = "String::is_empty")]
+    pub public: String,
+    #[serde(rename = "box", skip_serializing_if = "String::is_empty")]
+    pub sealed: String,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub declined: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub missing: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub ready: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub added: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub already: Option<usize>,
+}
+
+/// §3.4 `show`: what the phone reveals for one entry.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Revealed {
+    pub password: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kept: Option<String>,
+}
+
+impl Drop for Revealed {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.password.zeroize();
+        self.previous.zeroize();
+        self.kept.zeroize();
+    }
+}
+
+/// §3.4 `keep` / `import`: a site and the password the phone should seal for it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ToKeep {
+    pub site: Site,
+    pub password: String,
+}
+
+impl Drop for ToKeep {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.password.zeroize();
+    }
+}
+
 /// §3
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Site {
@@ -539,6 +677,59 @@ mod tests {
     }
 
     const SYNC_VECTOR: &str = "09090909090909090909090932c1ac9a31895ff6306e6f7139af6044bbaa5e2cd5af2f8be8722941db67734bc975fc8e3619d2fb92cd3ff5a4c822cd5e61945fc01acfc418438359b6d0a1381a3d6f376ef1a852c31477de98766e8aade92939144510ff34acca16cb79a7f6c37bff0d819279badb8e64b6f4d221b33f864606b5381b087f1baec866e03cc83fc6d59caa6d89de6db37d88967e9e2fd719d1e02c5ed656cf2247636d4f77c55f738f73";
+
+    #[test]
+    fn approval_vector() {
+        let (desktop, phone) = ([1; 32], [2; 32]);
+        let (desktop_pub, phone_pub) = (x25519_public(&desktop), x25519_public(&phone));
+        let key = answer_key(&desktop, &phone_pub, &desktop_pub, &phone_pub).unwrap();
+        assert_eq!(answer_key(&phone, &desktop_pub, &desktop_pub, &phone_pub).unwrap(), key, "both sides agree");
+        assert!(answer_key(&desktop, &[0; 32], &desktop_pub, &phone_pub).is_none(), "a low-order key is refused");
+        // Android's ApprovalTest asserts the same values.
+        let got = [
+            hex::encode(desktop_pub),
+            hex::encode(phone_pub),
+            hex::encode(approval_commit(&desktop_pub)),
+            approval_code(&desktop_pub, &phone_pub),
+            hex::encode(key),
+        ];
+        assert_eq!(got, APPROVAL_VECTOR);
+
+        let revealed = Revealed { password: "a".into(), previous: Some("b".into()), kept: None };
+        let sealed = box_seal(&key, &revealed, [3; 12]);
+        assert_eq!(box_open::<Revealed>(&key, &sealed).unwrap(), revealed);
+        assert!(box_open::<Revealed>(&[0; 32], &sealed).is_err());
+
+        // Android's ApprovalTest opens this request and seals the same box, byte for byte.
+        let request = Frame {
+            id: "ab".into(),
+            kind: "show".into(),
+            site: Some("github.com".into()),
+            login: Some(String::new()),
+            commit: hex::encode(approval_commit(&desktop_pub)),
+            ..Default::default()
+        };
+        let revealed = Revealed { password: "pw".into(), previous: None, kept: Some("old".into()) };
+        assert_eq!(hex::encode(frame_seal(&sync_key(&[7; 32]), REQUEST_AAD, &request, [4; 12])), APPROVAL_FRAME);
+        assert_eq!(box_seal(&key, &revealed, [3; 12]), APPROVAL_BOX);
+
+        let frame = Frame { id: "ab".into(), kind: "show".into(), login: Some(String::new()), ..Default::default() };
+        let bytes = frame_seal(&[5; 32], REQUEST_AAD, &frame, [4; 12]);
+        assert_eq!(frame_open(&[5; 32], REQUEST_AAD, &bytes).unwrap(), frame);
+        assert!(frame_open(&[5; 32], ANSWER_AAD, &bytes).is_err(), "a request can't pass as an answer");
+    }
+
+    /// desktopPub, phonePub, commit, code, answerKey. Confirmed by Python's `cryptography`.
+    const APPROVAL_VECTOR: [&str; 5] = [
+        "a4e09292b651c278b9772c569f5fa9bb13d906b46ab68c9df9dc2b4409f8a209",
+        "ce8d3ad1ccb633ec7b70c17814a5c76ecd029685050d344745ba05870e587d59",
+        "96fd0426e04d80775bd47312d4508dda42e8d2f44d38b55e2f27c08f41016cd2",
+        "437923",
+        "b0b00aa39da3bb7e44274a34529acae4ad457effe3404d6030e4d5e10fa8f7fa",
+    ];
+
+    const APPROVAL_FRAME: &str = "040404040404040404040404d589631975cf50fdef031efa339185e19bb9dcb8089757d17e0e4a3b5c8df9a62fa4ec1ca0f46299cf1397ed9d5300ce29b621cd794f9e3783461e81594fda122756b51a21b71f5846820ff7c64f1c9a4c5e65db49ec72c4837899b922817c93592f153390220f0b7c773ec7a4d1f0d5829d24386d5e62b49d25469dd9867f0bf7c0491813789c336e1cc694cc62b5b17463fd49";
+    const APPROVAL_BOX: &str = "030303030303030303030303260ef21ae3530030473a4b88650ce2721eb11da272f4fcdede823fc98cdf2dfb41c1ef0a9cd497a7f24af9e892d3";
 
     #[test]
     fn sync_messages_open_only_with_the_same_master() {

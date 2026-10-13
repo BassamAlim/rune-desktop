@@ -15,7 +15,7 @@ Both implement the algorithm below independently and must pass the same `vectors
 | Secret | What | Where it lives |
 |---|---|---|
 | Master password | Memorised by the user | Nowhere. Discarded after key derivation. |
-| Master key | Derived from the master password | On each device, encrypted (see §4) |
+| Master key | Derived from the master password | On the phone, encrypted (§4.1). Never kept on the desktop, which asks the phone (§3.4). |
 
 The master password is the only secret, so a new device needs only it. It is also the only
 defence once a site leaks one of its passwords: the attacker can then guess master passwords
@@ -137,7 +137,7 @@ sealed  = hex( nonce ‖ AES-256-GCM(sealKey, nonce, UTF-8 password, aad = "rune
 - `nonce` is 12 random bytes, fresh for every seal; the GCM tag is 16 bytes.
 - Not bound to the site or login, so renaming an entry keeps it readable. Editing a site carries it through untouched.
 - While kept, it is the site's password everywhere (shown, copied, autofilled); Rune's is offered beside it for the site's change-password form.
-- Set and opened only after an unlock: on Android the site screen holds `sealKey` (never the master key) while the password is shown and zeroes it on leaving.
+- Set and opened only after an unlock: on Android the site screen holds `sealKey` (never the master key) while the password is shown and zeroes it on leaving. The desktop asks the phone to do both (§3.4).
 - Both apps assert one vector (`seal_vector` in rune-core, `SealTest` on Android): master key `[7; 32]`, nonce `01..0c`, password `Hunter2 – ünïcode`.
 - One JSON file in app-private storage; the same format is the export/import file.
 - `modified` is when the entry last changed, in seconds since 1970; absent (older files) means 0. `deleted` remembers deletes; absent means none.
@@ -174,6 +174,71 @@ message = nonce ‖ AES-256-GCM(syncKey, nonce, UTF-8 JSON site list, aad = "run
 - On Android 17+ the phone needs the `ACCESS_LOCAL_NETWORK` permission, asked for on "Sync now".
 - Both apps assert one message (`sync_messages_open_only_with_the_same_master` in rune-core, `SyncTest` on Android).
 
+### 3.4 Approval from the phone
+
+The desktop never keeps the master key. Whatever needs it (a site's password, the previous one,
+a kept one, sealing a password to keep) is asked of the phone, which shows what is asked and
+answers after its own unlock (§4.1). It rides on the sync connection (§3.3); `rune/v1` is
+unchanged, so no password changes.
+
+```
+commit    = SHA-256("rune/v1/commit" ‖ desktopPub)
+code      = first 4 bytes of SHA-256("rune/v1/code" ‖ desktopPub ‖ phonePub), big-endian, mod 10⁶, as 6 digits
+answerKey = HKDF-SHA256(ikm = X25519(own private, other public), salt = desktopPub ‖ phonePub, info = "rune/v1/answer")
+frame     = 4-byte big-endian length ‖ nonce ‖ AES-256-GCM(syncKey, nonce, UTF-8 JSON, aad)
+box       = hex( nonce ‖ AES-256-GCM(answerKey, nonce, UTF-8 JSON, aad = "rune/v1/box") )
+```
+
+`desktopPub` and `phonePub` are fresh X25519 public keys (RFC 7748, 32 bytes, hex in JSON, like `commit`),
+made for one request and dropped with their private keys when it ends. `id` is 16 random bytes,
+hex. Every frame has a fresh random 12-byte nonce and is at most 4 MiB. The desktop's frames are
+sealed with `syncKey` and aad `rune/v1/request`, the phone's with `syncKey` and `rune/v1/answer`;
+what is secret inside them goes in a `box`.
+
+1. **Ask.** The desktop says "Approve on your phone". A request waits until answered, cancelled,
+   or 2 minutes pass. One at a time: a new one replaces it.
+2. **Notice.** While a request waits, the desktop answers the probe with `rune-sync/1 <fingerprint> ask`
+   instead of the plain probe. While the app is in front, the phone probes every 2 s and syncs when
+   the answer ends in ` ask`. A probe answer isn't authenticated: a forged `ask` only causes a sync.
+3. **Hand over.** After the merged list (§3.3), on the same connection, the desktop sends the
+   request, or `{}` when there is none. A phone that doesn't know this frame just closes the
+   connection; the request keeps waiting.
+   - `{"id", "kind": "show", "site", "login", "commit"}`, for the site card;
+   - `{"id", "kind": "keep" | "import", "count", "commit"}`, for passwords the phone should seal.
+4. **Agree a code.** The phone answers `{"id", "pub": phonePub}`; the desktop then sends
+   `{"id", "pub": desktopPub}`, and the phone checks it against `commit`. Both show `code`.
+   Committing first means neither side can pick its key after seeing the other's, so a
+   man-in-the-middle can't make the two codes match except by a 1-in-10⁶ chance.
+5. **Approve.** The phone shows the request and the code, and unlocks as for any password (§4.1).
+   The user checks the code is the desktop's. Declining answers `{"id", "declined": true}`. The
+   connection stays open while the prompt is up, within the 2 minutes.
+6. **Answer.**
+   - `show`: the phone looks the entry up in its own list, just merged, and answers `{"id", "box"}`
+     over `{"password", "previous", "kept"}`: Rune's password, the one for counter − 1 when the
+     counter is above 1, and the kept password opened (§3.1) when there is one; the last two are
+     absent otherwise. The settings (counter, length, classes, symbols) are the phone's, never the
+     request's, so a request reveals only what the phone would show for that entry. An entry the
+     phone doesn't have answers `{"id", "missing": true}`.
+   - `keep` / `import`: the phone answers `{"id", "ready": true}`. The passwords go the other way,
+     so here the desktop is the one that must trust the code: it asks "Does your phone show
+     <code>?" and only then sends `{"id", "box"}` over a list of `{"site", "password"}`, each `site` an
+     entry in the site-list format (§3). The phone seals each (§3.1), saves, answers
+     `{"id", "added", "already"}`, and syncs, which brings the result to the desktop. `keep` is one
+     existing entry and sets its kept password; `import` adds the sites not yet in the list and
+     leaves those already there alone (`already`).
+
+- What malware on the desktop can get: the answers to requests made while it is there, never the
+  master key. A request it makes on its own shows its site on the phone, unasked.
+- A stolen `syncKey` on the same network reads which sites are asked for, never the answers.
+  Posing as either side, or sitting between them, shows codes that don't match.
+- The phone answers only in front, behind a prompt, and holds the master key only while answering.
+- **Without the phone**, the desktop offers the master password instead: it derives the master key,
+  checks the fingerprint (§2.4), does the same work itself and zeroes the key at once. Setup works
+  the same way: the master password is typed once, and only `syncKey` and the fingerprint are kept.
+- Both apps assert one approval (`approval_vector` in rune-core, `ApprovalTest` on Android): X25519
+  private keys `[1; 32]` (desktop) and `[2; 32]` (phone), giving `commit`, `code` (`437923`) and `answerKey`;
+  confirmed by a third implementation (Python `cryptography`).
+
 ## 4. Android
 
 Structured like the owner's other apps: `core/` (crypto, vault, data, nav, ui, autofill) and
@@ -197,6 +262,7 @@ with type-safe routes, one `StateFlow<UiState>` per ViewModel.
 3. **Site** — opening it asks for the fingerprint; the password is shown masked with reveal and copy, and forgotten when the screen is left. When the counter is above 1, the previous password (counter − 1) can be copied too, for a site's change-password form; it comes from the same unlock.
 4. **Editor** — site, login, counter, length, classes, allowed symbols; delete behind a confirmation.
 5. **Settings** — autofill, your key, fingerprint unlock, export/import, reset.
+6. **Approval** — a sheet over whatever is in front when the desktop asks (§3.4): what is asked (the site and login, or how many passwords to keep), the code, then the unlock. Approve or decline.
 
 ### 4.3 Autofill
 
@@ -223,10 +289,11 @@ Kotlin, Jetpack Compose (Material 3), Hilt, Navigation Compose, DataStore, `andr
 
 - One Cargo workspace: `rune-core` (library: algorithm + site list, no I/O beyond the JSON file) and `rune-desktop` (GUI binary).
 - GUI: `eframe`/`egui`, native Wayland. Screens: setup, sites (list with the selected site's password in a card below, and the previous password to copy when the counter is above 1), site editor, settings.
-- The master key is never stored. The Secret Service keyring (KWallet on KDE, via the `keyring` crate) holds `syncKey` ‖ key fingerprint: sync keeps answering the phone while Rune is locked (§3.3), and the fingerprint rejects a mistyped master password. Setup is the same as Android's (generated or own). Each launch asks for the master password; Rune locks again after 5 idle minutes (wall-clock, so sleep counts, and checked while minimised) or from the lock button, forgetting the master key and whatever was shown. A keyring entry holding the master key itself (Rune before the lock) is replaced by this on first launch.
+- The site list holds no secrets, so Rune opens straight to it, with no lock. The site card's password comes from the phone (§3.4, `show`): one approval gives the password, the previous one and the kept one, held while the card is open and forgotten on leaving it or after 5 idle minutes (wall-clock, so sleep counts, and checked while minimised). Typing a site's old password to keep it is a `keep` request.
+- The master key is never stored. The Secret Service keyring (KWallet on KDE, via the `keyring` crate) holds `syncKey` ‖ key fingerprint: for sync and approvals (§3.3, §3.4), and to reject a mistyped master password in setup and the fallback. Setup is the same as Android's (generated or own). A keyring entry holding the master key itself (an older Rune) is replaced by this on first launch.
 - Copy flags the password so clipboard managers (Klipper) keep it out of history, and clears it after 30 s if it is still what is on the clipboard.
 - Site list at `$XDG_DATA_HOME/rune/sites.json`. Export and import through the system file dialog.
-- Import also takes a Bitwarden export (unencrypted `.json`), for moving in. Each login becomes a site named by its first web address (or its name, for an app or an entry with no address), with its username, any `androidapp://` addresses as linked apps, and its password kept sealed (§3.1) until switched to Rune's. An account already in Rune is left alone. Left behind on purpose: notes (the site list isn't encrypted), TOTP seeds, cards and identities. Desktop only, where the master key is at hand; sync (§3.3) carries the result to the phone.
+- Import also takes a Bitwarden export (unencrypted `.json`), for moving in. Each login becomes a site named by its first web address (or its name, for an app or an entry with no address), with its username, any `androidapp://` addresses as linked apps, and its password kept sealed (§3.1) until switched to Rune's. An account already in Rune is left alone. Left behind on purpose: notes (the site list isn't encrypted), TOTP seeds, cards and identities. Read on the desktop, where the export file is, and sealed by the phone as one `import` request (§3.4); sync brings the result back.
 - This repo owns `SPEC.md` and `vectors.json`; `cargo run -p rune-core --example gen-vectors` regenerates the vectors. `rune-android` holds a copy of `vectors.json` only.
 
 ## 5a. Design
@@ -244,6 +311,7 @@ vector drawables.
 - `vectors.json`: fixed (master password, site, login, counter, policy) → expected master key, site key, password, fingerprint. Generated by the Rust core, checked into both repos, asserted by both.
 - Before the vectors are frozen, one vector is confirmed by a throwaway third implementation (Python, `argon2-cffi` + stdlib `hmac`), so the two apps can't simply agree on the same mistake.
 - Must include: empty login, non-ASCII site name, a policy that forces a rejected candidate, counter 2.
+- Sealing, sync and approval each have one shared vector, asserted by both apps (§3.1, §3.3, §3.4).
 
 ## 7. Not in v1
 
@@ -259,3 +327,5 @@ vector drawables.
 - Changing or forgetting the master password changes or loses every password.
 - An attacker with one site password can guess the master password offline at Argon2id cost: a generated passphrase is out of reach, a weak own password is not.
 - The clipboard is readable by other apps while the password is on it; prefer autofill.
+- Copying a password on the desktop needs the phone at hand, on the same network. The master-password fallback works without it, but puts the master key on the desktop for that moment.
+- Malware running as the user on the desktop sees every password asked for while it is there (§3.4). Only the phone keeps the master key out of its reach.
