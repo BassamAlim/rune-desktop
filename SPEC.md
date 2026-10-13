@@ -3,9 +3,9 @@
 Deterministic password generator. Same inputs, same password; Rune's passwords are never stored.
 The one exception is temporary: a site's old password, sealed (§3.1), until it is changed to Rune's.
 
-Two private GitHub repos, personal use only:
+Two GitHub repos:
 
-- `rune-android` — Kotlin/Compose app, sideloaded APK, minSdk 30 (Android 11)
+- [`rune-android`](https://github.com/BassamAlim/rune-android) — Kotlin/Compose app, sideloaded APK, minSdk 30 (Android 11)
 - `rune-desktop` — Rust app for Linux
 
 Both implement the algorithm below independently and must pass the same `vectors.json`.
@@ -43,7 +43,7 @@ single spaces. Case is kept. `u32be(x)` is a 4-byte big-endian integer.
 ```
 masterKey = Argon2id(
     password = masterPassword,
-    salt     = "rune/v1/master",   # fixed: Rune has one user, so there is no crowd to precompute against
+    salt     = "rune/v1/master",   # fixed, with no per-user part: a new device needs only the master password (§8)
     m = 65536 KiB (64 MiB), t = 3, p = 4, version = 0x13,
     length   = 32)
 ```
@@ -327,6 +327,7 @@ vector drawables.
 
 - Changing or forgetting the master password changes or loses every password.
 - An attacker with one site password can guess the master password offline at Argon2id cost: a generated passphrase is out of reach, a weak own password is not.
+- The master key's salt is fixed (§2.1), so the same master password gives the same master key for everyone, and one Argon2id guess can be tried against every user whose site password has leaked. Rune was designed for one user; with many, a weak own master password is more exposed than a per-user salt would leave it. Changing this means `rune/v2`.
 - The clipboard is readable by other apps while the password is on it; prefer autofill.
 - Copying a password on the desktop needs the phone at hand, on the same network. The master-password fallback works without it, but puts the master key on the desktop for that moment.
 - Malware running as the user on the desktop sees every password asked for while it is there (§3.4). Only the phone keeps the master key out of its reach.

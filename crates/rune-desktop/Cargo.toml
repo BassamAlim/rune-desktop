@@ -2,6 +2,8 @@
 name = "rune-desktop"
 version = "0.1.0"
 edition = "2024"
+license = "GPL-3.0-only"
+repository = "https://github.com/BassamAlim/rune-desktop"
 
 [dependencies]
 arboard = { version = "3.6.1", default-features = false, features = ["wayland-data-control"] }
