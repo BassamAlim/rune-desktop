@@ -1,7 +1,7 @@
 use std::cell::Cell;
 
 use eframe::egui::accesskit::Role;
-use egui_kittest::{Harness, kittest::Queryable};
+use egui_kittest::{Harness, kittest::{NodeT, Queryable}};
 
 use super::*;
 
@@ -64,6 +64,21 @@ fn click(harness: &mut Harness<'_, App>, label: &str) {
     harness.run();
 }
 
+/// For a label that is also a heading, like the editor's "Add site".
+fn button<'a>(harness: &'a Harness<'_, App>, label: &str) -> egui_kittest::Node<'a> {
+    harness
+        .query_all_by_role(Role::Button)
+        .find(|b| b.accesskit_node().label().is_some_and(|l| l.contains(label)))
+        .unwrap()
+}
+
+fn click_button(harness: &mut Harness<'_, App>, label: &str) {
+    button(harness, label).scroll_to_me();
+    harness.run();
+    button(harness, label).click();
+    harness.run();
+}
+
 /// Drives the real UI headlessly: add a site, read its password, hit the duplicate check, delete it.
 #[test]
 fn add_show_and_delete_a_site() {
@@ -75,7 +90,7 @@ fn add_show_and_delete_a_site() {
     click(&mut harness, "Add a site");
     type_into(&mut harness, 0, "  GitHub.COM");
     type_into(&mut harness, 1, "Bassam ");
-    click(&mut harness, "Save");
+    click_button(&mut harness, "Add site");
 
     // Saving stamps the change, so it wins over older copies when devices sync.
     let modified = harness.state().sites.sites[0].modified;
@@ -94,7 +109,7 @@ fn add_show_and_delete_a_site() {
     click(&mut harness, "Add site");
     type_into(&mut harness, 0, "github.com");
     type_into(&mut harness, 1, "BASSAM");
-    click(&mut harness, "Save");
+    click_button(&mut harness, "Add site");
     harness.get_by_label_contains("That site and login already exist.");
     assert_eq!(harness.state().sites.sites.len(), 1);
     click(&mut harness, "Cancel");
@@ -302,7 +317,12 @@ fn screenshots() {
     let dir = temp_dir("shots");
     let sites = vec![
         site("bank.example", ""),
-        Site { counter: 2, note: "username: bassam_m".into(), ..site("github.com", "bassam") },
+        Site {
+            counter: 2,
+            note: "username: bassam_m".into(),
+            apps: vec!["com.github.android".into()],
+            ..site("github.com", "bassam")
+        },
         site("github.com", "work"),
         site("mail.example", "bassam@example.com"),
         site("news.example", ""),
@@ -340,6 +360,10 @@ fn screenshots() {
     shoot("5-editor", &|app| {
         app.sites.sites = sites.clone();
         app.screen = Screen::Editor(Editor::new(Some(1), &sites[1]));
+    });
+    shoot("5b-add", &|app| {
+        app.sites.sites = sites.clone();
+        app.screen = Screen::Editor(Editor { focus_site: false, ..Editor::blank() });
     });
     shoot("6-settings", &|app| {
         app.sites.sites = sites.clone();

@@ -38,6 +38,8 @@ struct Editor {
     sealed: String,
     confirm_delete: bool,
     focus_site: bool,
+    /// Everything but site, login and note is rarely touched, so it folds away unless in use.
+    expanded: bool,
 }
 
 impl Editor {
@@ -58,6 +60,10 @@ impl Editor {
             sealed: site.sealed.clone(),
             confirm_delete: false,
             focus_site: index.is_none(),
+            expanded: site.length != DEFAULT_LENGTH
+                || site.classes != "luds"
+                || site.symbols != DEFAULT_SYMBOLS
+                || site.counter != 1,
         }
     }
 
@@ -698,6 +704,26 @@ impl App {
             if std::mem::take(&mut editor.focus_site) {
                 site.request_focus();
             }
+            // Linked on the phone, where the apps are; here they can only be unlinked.
+            if !editor.apps.is_empty() {
+                ui.label(theme::small("Apps linked on your phone"));
+                let mut unlinked = None;
+                for (i, app) in editor.apps.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if theme::icon_button(ui, icon::X, &format!("Unlink {app}")).clicked() {
+                                unlinked = Some(i);
+                            }
+                            ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                                ui.add(egui::Label::new(RichText::new(app).monospace()).truncate());
+                            });
+                        });
+                    });
+                }
+                if let Some(i) = unlinked {
+                    editor.apps.remove(i);
+                }
+            }
             theme::field(ui, "Login (optional)", |ui| {
                 ui.add(theme::text_field(&mut editor.login).hint_text("username or email"))
             });
@@ -706,53 +732,61 @@ impl App {
             });
         });
 
-        theme::card().show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.label(theme::small("Length"));
-            ui.add(egui::Slider::new(&mut editor.length, 4..=64).suffix(" characters"));
-            ui.add_space(4.0);
+        let (glyph, label) =
+            if editor.expanded { (icon::CARET_UP, "Fewer options") } else { (icon::CARET_DOWN, "More options") };
+        if ui.add(egui::Button::new(theme::icon_text(glyph, label, theme::ACCENT, 15.0)).frame(false)).clicked() {
+            editor.expanded = !editor.expanded;
+        }
 
-            ui.label(theme::small("Characters"));
-            ui.horizontal(|ui| {
-                for (on, label) in [
-                    (&mut editor.lower, "a–z"),
-                    (&mut editor.upper, "A–Z"),
-                    (&mut editor.digits, "0–9"),
-                    (&mut editor.symbols, "!@#"),
-                ] {
-                    ui.toggle_value(on, label);
-                }
-            });
-            if editor.symbols {
-                theme::field(ui, "Symbols this site allows", |ui| {
-                    ui.add(theme::text_field(&mut editor.symbol_set).font(egui::TextStyle::Monospace))
+        if editor.expanded {
+            theme::card().show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(theme::small("Length"));
+                ui.add(egui::Slider::new(&mut editor.length, 4..=64).suffix(" characters"));
+                ui.add_space(4.0);
+
+                ui.label(theme::small("Characters"));
+                ui.horizontal(|ui| {
+                    for (on, label) in [
+                        (&mut editor.lower, "a–z"),
+                        (&mut editor.upper, "A–Z"),
+                        (&mut editor.digits, "0–9"),
+                        (&mut editor.symbols, "!@#"),
+                    ] {
+                        ui.toggle_value(on, label);
+                    }
                 });
-                if ui.small_button("Reset to the usual symbols").clicked() {
-                    editor.symbol_set = DEFAULT_SYMBOLS.to_string();
+                if editor.symbols {
+                    theme::field(ui, "Symbols this site allows", |ui| {
+                        ui.add(theme::text_field(&mut editor.symbol_set).font(egui::TextStyle::Monospace))
+                    });
+                    if ui.small_button("Reset to the usual symbols").clicked() {
+                        editor.symbol_set = DEFAULT_SYMBOLS.to_string();
+                    }
                 }
-            }
-            ui.add_space(4.0);
+                ui.add_space(4.0);
 
-            ui.label(theme::small("Counter"));
-            ui.horizontal(|ui| {
-                if ui.add_enabled(editor.counter > 1, theme::button(icon::MINUS, "")).clicked() {
-                    editor.counter -= 1;
-                }
-                ui.add_sized(
-                    [48.0, 36.0],
-                    egui::DragValue::new(&mut editor.counter).range(1..=u32::MAX),
-                );
-                if ui.add(theme::button(icon::PLUS, "")).clicked() {
-                    editor.counter = editor.counter.saturating_add(1);
-                }
+                ui.label(theme::small("Counter"));
+                ui.horizontal(|ui| {
+                    if ui.add_enabled(editor.counter > 1, theme::button(icon::MINUS, "")).clicked() {
+                        editor.counter -= 1;
+                    }
+                    ui.add_sized(
+                        [48.0, 36.0],
+                        egui::DragValue::new(&mut editor.counter).range(1..=u32::MAX),
+                    );
+                    if ui.add(theme::button(icon::PLUS, "")).clicked() {
+                        editor.counter = editor.counter.saturating_add(1);
+                    }
+                });
+                ui.label(theme::small("Raise it to get a new password for this site."));
+                ui.add_space(4.0);
+                ui.label(theme::small(format!(
+                    "Strength: about {:.0} bits",
+                    entropy_bits(editor.length, &editor.classes(), &editor.symbol_set)
+                )));
             });
-            ui.label(theme::small("Raise it to get a new password for this site."));
-            ui.add_space(4.0);
-            ui.label(theme::small(format!(
-                "Strength: about {:.0} bits",
-                entropy_bits(editor.length, &editor.classes(), &editor.symbol_set)
-            )));
-        });
+        }
 
         if editor.index.is_some() {
             theme::note(ui, icon::WARNING, "Changing anything here changes this site's password.", theme::MUTED);
@@ -764,7 +798,8 @@ impl App {
         let mut selected = None;
         let mut saved = false;
         ui.horizontal(|ui| {
-            if ui.add(theme::primary_button("", "Save")).clicked() {
+            let save = if editor.index.is_some() { "Save changes" } else { "Add site" };
+            if ui.add(theme::primary_button("", save)).clicked() {
                 let result = editor.to_site().and_then(|site| {
                     let key = (site.site.clone(), site.login.clone());
                     updated.put(site, editor.index, store::now())?;
@@ -776,7 +811,11 @@ impl App {
                         selected = position;
                         saved = true;
                     }
-                    Err(e) => self.error = e,
+                    Err(e) => {
+                        // The error may be about a folded-away setting.
+                        editor.expanded = true;
+                        self.error = e;
+                    }
                 }
             }
             if ui.button("Cancel").clicked() {
