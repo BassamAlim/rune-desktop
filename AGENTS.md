@@ -1,7 +1,8 @@
 # AGENTS.md
 
 Rune for Linux: a deterministic password generator. One master password becomes a
-different password for every site; passwords are derived, never stored. `README.md`
+different password for every site; passwords are derived, never stored (except a site's old
+password, sealed under the master key until it's switched to Rune's; SPEC §3.1). `README.md`
 has the layout, commands and where data lives.
 
 This repo is the **contract owner** for both apps. `SPEC.md` (algorithm, site-list format,
@@ -18,11 +19,15 @@ The passphrase wordlist `crates/rune-core/words.txt` is shared the same way, as
   vectors from `cargo run -p rune-core --example gen-vectors`, and the same change in Android.
 - **Secrets are zeroized after use.** The master password, confirmation and derived passwords
   are wiped with `zeroize` once consumed; a new field holding a secret gets the same treatment.
+- **Every change to the site list goes through `SiteList::put` / `remove`** (rune-core), which
+  stamp it (SPEC §3.2). A change that skips them loses to older copies when devices sync.
 - **An unreadable site list stops the app** (`Screen::Fatal`) rather than starting empty:
   counters can't be recomputed, so overwriting the file loses passwords.
-- **Machine access goes through `store.rs`**: keyring, clipboard, paths, randomness, and the
-  only network requests (each site's `/favicon.ico` and homepage, for its logo and display name,
-  cached under `~/.cache/rune/icons` and `names`). `main.rs`
+- **Machine access goes through `store.rs`**: keyring, clipboard, paths, randomness, and all
+  networking: each site's `/favicon.ico` and homepage (its logo and display name, cached under
+  `~/.cache/rune/icons` and `names`), and the listener that answers the phone's sync (SPEC §3.3).
+  That listener merges into `sites.json` itself, so sync works while the window is minimised;
+  the window reloads when told. `main.rs`
   stays screens only, which keeps the screens testable with `egui_kittest`.
 
 ## Design

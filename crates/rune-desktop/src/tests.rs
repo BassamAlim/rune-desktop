@@ -45,6 +45,8 @@ fn site(name: &str, login: &str) -> Site {
         symbols: DEFAULT_SYMBOLS.into(),
         apps: vec![],
         note: String::new(),
+        sealed: String::new(),
+        modified: 0,
     }
 }
 
@@ -75,7 +77,10 @@ fn add_show_and_delete_a_site() {
     type_into(&mut harness, 1, "Bassam ");
     click(&mut harness, "Save");
 
-    let expected = site("github.com", "bassam");
+    // Saving stamps the change, so it wins over older copies when devices sync.
+    let modified = harness.state().sites.sites[0].modified;
+    assert!(modified > 0);
+    let expected = Site { modified, ..site("github.com", "bassam") };
     assert_eq!(harness.state().sites.sites, vec![expected.clone()]);
     assert_eq!(SiteList::load(&path).unwrap().sites, vec![expected]);
     assert_eq!(harness.state().selected, Some(0));
@@ -203,6 +208,84 @@ fn own_master_password_is_hidden_until_shown() {
 }
 
 #[test]
+fn an_old_password_is_kept_sealed_until_switched() {
+    let path = temp_dir("keep").join("sites.json");
+    let mut app = app_with_keys(path.clone());
+    app.sites.sites = vec![site("github.com", "")];
+    app.selected = Some(0);
+    let mut harness = harness(app, Harness::builder());
+
+    harness.get_by_label_contains("Use my old password for now").click();
+    harness.run();
+    harness.get_by_role(Role::PasswordInput).click();
+    harness.run();
+    harness.get_by_role(Role::PasswordInput).type_text("Hunter2!");
+    harness.run();
+    harness.get_by_label_contains("Keep it").click();
+    harness.run();
+
+    let sealed = harness.state().sites.sites[0].sealed.clone();
+    assert!(!sealed.is_empty() && !sealed.contains("Hunter2"));
+    assert_eq!(rune_core::open(&rune_core::seal_key(&MASTER), &sealed).unwrap(), "Hunter2!");
+    assert_eq!(SiteList::load(&path).unwrap().sites[0].sealed, sealed, "saved, not just shown");
+
+    harness.get_by_label_contains("Switch to Rune's password").click();
+    harness.run();
+    harness.get_by_label("Yes, I've changed it").click();
+    harness.run();
+    assert_eq!(harness.state().sites.sites[0].sealed, "");
+}
+
+#[test]
+fn a_phone_with_the_same_master_syncs_over_the_network() {
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream, UdpSocket};
+
+    let path = temp_dir("sync").join("sites.json");
+    SiteList { version: 1, sites: vec![site("a", ""), site("b", "")], deleted: vec![] }.save(&path).unwrap();
+    let key = rune_core::sync_key(&MASTER);
+    let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let listener = store::listen_for_sync(port, key, "ef15", path.clone(), || {}).unwrap();
+
+    // Found by its own fingerprint only.
+    let phone = UdpSocket::bind("127.0.0.1:0").unwrap();
+    phone.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+    let mut answer = [0u8; 64];
+    phone.send_to(b"rune-sync/1 0000", ("127.0.0.1", port)).unwrap();
+    assert!(phone.recv_from(&mut answer).is_err());
+    phone.send_to(b"rune-sync/1 ef15", ("127.0.0.1", port)).unwrap();
+    let (n, _) = phone.recv_from(&mut answer).unwrap();
+    assert_eq!(&answer[..n], b"rune-sync/1 ef15");
+
+    // The phone deleted "a" and added "c".
+    let mut theirs = SiteList { version: 1, sites: vec![site("b", ""), site("c", "")], deleted: vec![] };
+    theirs.deleted.push(rune_core::Deleted { site: "a".into(), login: String::new(), modified: 5 });
+    let exchange = |key: &rune_core::Key| {
+        let message = rune_core::sync_seal(key, &theirs, [3; 12]);
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        stream.write_all(&(message.len() as u32).to_be_bytes()).unwrap();
+        stream.write_all(&message).unwrap();
+        let mut length = [0u8; 4];
+        stream.read_exact(&mut length).ok()?;
+        let mut reply = vec![0u8; u32::from_be_bytes(length) as usize];
+        stream.read_exact(&mut reply).ok()?;
+        rune_core::sync_open(key, &reply).ok()
+    };
+
+    assert!(exchange(&rune_core::sync_key(&[8; 32])).is_none(), "another master password gets no answer");
+    assert_eq!(SiteList::load(&path).unwrap().sites.len(), 2, "and changes nothing");
+
+    let merged = exchange(&key).unwrap();
+    assert_eq!(merged.sites.iter().map(|s| s.site.as_str()).collect::<Vec<_>>(), ["b", "c"]);
+    assert_eq!(SiteList::load(&path).unwrap(), merged, "saved, not just answered");
+    assert_eq!(listener.synced.recv_timeout(Duration::from_secs(1)), Ok(true));
+
+    assert_eq!(exchange(&key).unwrap(), merged);
+    assert_eq!(listener.synced.recv_timeout(Duration::from_secs(1)), Ok(false), "a second sync changes nothing");
+}
+
+#[test]
 fn strength_ranks_common_passwords_weak_and_passphrases_strong() {
     assert_eq!(strength("Bassam2024!").1, theme::DANGER);
     assert_eq!(strength("password123").1, theme::DANGER);
@@ -245,6 +328,12 @@ fn screenshots() {
     shoot("3-empty", &|_| {});
     shoot("4-sites", &|app| {
         app.sites.sites = sites.clone();
+        app.selected = Some(1);
+        app.show_password = true;
+    });
+    shoot("4b-kept", &|app| {
+        app.sites.sites = sites.clone();
+        app.sites.sites[1].sealed = rune_core::seal(&rune_core::seal_key(&MASTER), "Hunter2!", [0; 12]);
         app.selected = Some(1);
         app.show_password = true;
     });

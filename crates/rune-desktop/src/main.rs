@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use arboard::Clipboard;
 use rune_core::{
     DEFAULT_LENGTH, DEFAULT_SYMBOLS, Site, SiteList, canonical_symbols, entropy_bits, fingerprint, master_key, passphrase, passphrase_bits,
-    normalize, password, site_key,
+    normalize, open, password, seal, seal_key, site_key,
 };
 use eframe::egui::{self, Align, Key, Layout, RichText, Sense, Ui};
 use store::Keys;
@@ -34,6 +34,8 @@ struct Editor {
     symbol_set: String,
     apps: Vec<String>,
     note: String,
+    /// Carried through an edit untouched: only the site card sets or clears it.
+    sealed: String,
     confirm_delete: bool,
     focus_site: bool,
 }
@@ -53,6 +55,7 @@ impl Editor {
             symbol_set: site.symbols.clone(),
             apps: site.apps.clone(),
             note: site.note.clone(),
+            sealed: site.sealed.clone(),
             confirm_delete: false,
             focus_site: index.is_none(),
         }
@@ -70,6 +73,8 @@ impl Editor {
                 symbols: DEFAULT_SYMBOLS.to_string(),
                 apps: vec![],
                 note: String::new(),
+                sealed: String::new(),
+                modified: 0,
             },
         )
     }
@@ -105,6 +110,9 @@ impl Editor {
             apps: self.apps.clone(),
             // Kept as typed: a username's case can matter.
             note: self.note.trim().to_owned(),
+            sealed: self.sealed.clone(),
+            // Stamped by `SiteList::put` when it is saved.
+            modified: 0,
         })
     }
 }
@@ -155,6 +163,10 @@ struct App {
     focus_search: bool,
     selected: Option<usize>,
     show_password: bool,
+    /// The site's own password being typed in, to keep until it's changed to Rune's.
+    keeping: Option<String>,
+    /// Asked once before the kept password is thrown away.
+    confirm_switch: bool,
     clipboard: Option<Clipboard>,
     copied_at: Option<Instant>,
     /// Favicons and their tile colours by site name, once settled; `None` for a site that has none.
@@ -162,12 +174,19 @@ struct App {
     /// Names sites give themselves ("GitHub"), once settled; `None` for a site that gives none.
     names: HashMap<String, Option<String>>,
     /// Off in tests, so rendering a screen never touches the network.
-    fetch_icons: bool,
+    online: bool,
+    /// Answers the phone's sync (SPEC §3.3) while there are keys to prove it's ours.
+    sync: Option<store::SyncListener>,
+    /// Why sync isn't listening, e.g. another Rune already is.
+    sync_error: Option<String>,
+    synced_at: Option<Instant>,
+    /// A sync changed the file while the editor was open; reloaded on leaving it.
+    reload_sites: bool,
 }
 
 impl App {
     fn new() -> Self {
-        Self { fetch_icons: true, ..Self::start(store::sites_path(), store::load_keys(store::ACCOUNT)) }
+        Self { online: true, ..Self::start(store::sites_path(), store::load_keys(store::ACCOUNT)) }
     }
 
     fn start(sites_path: PathBuf, keys: Result<Option<Keys>, String>) -> Self {
@@ -180,15 +199,21 @@ impl App {
             confirm: String::new(),
             show_master: false,
             keys: None,
-            sites: SiteList { version: 1, sites: vec![] },
+            sites: SiteList { version: 1, sites: vec![], deleted: vec![] },
             sites_path,
             search: String::new(),
             focus_search: true,
             selected: None,
             icons: HashMap::new(),
             names: HashMap::new(),
-            fetch_icons: false,
+            online: false,
+            sync: None,
+            sync_error: None,
+            synced_at: None,
+            reload_sites: false,
             show_password: false,
+            keeping: None,
+            confirm_switch: false,
             clipboard: None,
             copied_at: None,
         };
@@ -389,6 +414,10 @@ impl App {
         self.selected = index;
         self.show_password = false;
         self.copied_at = None;
+        if let Some(mut typed) = self.keeping.take() {
+            typed.zeroize();
+        }
+        self.confirm_switch = false;
     }
 
     fn sites_screen(&mut self, ui: &mut Ui) -> Option<Screen> {
@@ -459,8 +488,8 @@ impl App {
                         continue;
                     }
                     shown += 1;
-                    let icon = if self.fetch_icons { site_icon(&mut self.icons, ui.ctx(), &site.site) } else { None };
-                    let name = display_name(&mut self.names, self.fetch_icons, ui.ctx(), &site.site);
+                    let icon = if self.online { site_icon(&mut self.icons, ui.ctx(), &site.site) } else { None };
+                    let name = display_name(&mut self.names, self.online, ui.ctx(), &site.site);
                     if site_row(ui, site, &name, icon, self.selected == Some(i)).clicked() {
                         clicked = Some(i);
                     }
@@ -493,16 +522,21 @@ impl App {
                 password(&key, site.length, &site.classes, &site.symbols).ok()
             })
             .flatten();
+        // §3.1: a site not yet switched to Rune's password shows its own, kept sealed.
+        let mut sealer = seal_key(&keys.master);
+        let mut kept = (!site.sealed.is_empty()).then(|| open(&sealer, &site.sealed));
+        // Some("") clears the kept password; Some(sealed) keeps a new one.
+        let mut new_sealed: Option<String> = None;
         let mut next = None;
         theme::card().show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
-                let name = display_name(&mut self.names, self.fetch_icons, ui.ctx(), &site.site);
-                let subtitle = site_subtitle(&name, &site);
+                let name = display_name(&mut self.names, self.online, ui.ctx(), &site.site);
+                let subtitle = &site.login;
                 ui.vertical(|ui| {
                     ui.label(RichText::new(&name).strong().size(16.0));
                     if !subtitle.is_empty() {
-                        ui.label(theme::small(&subtitle));
+                        ui.label(theme::small(subtitle));
                     }
                     if !site.note.is_empty() {
                         ui.label(&site.note);
@@ -514,12 +548,23 @@ impl App {
                     }
                 });
             });
-            let mut pw = match generated {
+            let mut runes = match generated {
                 Ok(pw) => pw,
                 Err(e) => {
                     ui.colored_label(theme::DANGER, format!("This site's settings are invalid: {e}"));
                     return;
                 }
+            };
+            let mut pw = match &kept {
+                Some(Ok(old)) => {
+                    ui.label(theme::small("Your old password. Change it on the site to Rune's, then switch."));
+                    old.clone()
+                }
+                Some(Err(e)) => {
+                    ui.colored_label(theme::DANGER, format!("The kept password can't be read: {e}"));
+                    runes.clone()
+                }
+                None => runes.clone(),
             };
 
             egui::Frame::new()
@@ -555,11 +600,54 @@ impl App {
             }
             pw.zeroize();
 
-            if let Some(previous) = &previous
+            if kept.is_some() {
+                // The site's change-password form wants the new one too.
+                ui.horizontal_wrapped(|ui| {
+                    if ui.add(theme::button(icon::COPY, "Copy Rune's password")).clicked() {
+                        self.copy(runes.clone());
+                    }
+                    if !self.confirm_switch {
+                        if ui.add(theme::button(icon::ARROWS_CLOCKWISE, "Switch to Rune's password")).clicked() {
+                            self.confirm_switch = true;
+                        }
+                    } else if ui.add(theme::danger_button("", "Yes, I've changed it")).clicked() {
+                        new_sealed = Some(String::new());
+                    }
+                });
+                if self.confirm_switch {
+                    ui.label(theme::small("Rune forgets the old password and shows its own from now on."));
+                }
+            } else if let Some(previous) = &previous
                 && ui.add(theme::button(icon::CLOCK_COUNTER_CLOCKWISE, "Copy previous password")).clicked()
             {
                 self.copy(previous.clone());
             }
+
+            if kept.is_none() {
+                let mut cancel = false;
+                match &mut self.keeping {
+                    None => {
+                        if ui.add(theme::button(icon::KEY, "Use my old password for now")).clicked() {
+                            self.keeping = Some(String::new());
+                        }
+                    }
+                    Some(typed) => {
+                        theme::field(ui, "Your current password on this site", |ui| {
+                            ui.add(theme::text_field(typed).password(true))
+                        });
+                        ui.horizontal(|ui| {
+                            if ui.add(theme::button(icon::CHECK, "Keep it")).clicked() && !typed.is_empty() {
+                                new_sealed = Some(seal(&sealer, typed, store::nonce()));
+                            }
+                            cancel = ui.button("Cancel").clicked();
+                        });
+                    }
+                }
+                if cancel && let Some(mut typed) = self.keeping.take() {
+                    typed.zeroize();
+                }
+            }
+            runes.zeroize();
 
             ui.label(theme::small(if self.copied_at.is_some() {
                 format!("The clipboard is cleared after {} seconds.", store::CLIPBOARD_CLEAR_AFTER.as_secs())
@@ -574,6 +662,21 @@ impl App {
         });
         if let Some(previous) = &mut previous {
             previous.zeroize();
+        }
+        if let Some(Ok(old)) = &mut kept {
+            old.zeroize();
+        }
+        sealer.zeroize();
+        if let Some(sealed) = new_sealed {
+            let mut updated = self.sites.clone();
+            let changed = Site { sealed, ..updated.sites[index].clone() };
+            match updated.put(changed, Some(index), store::now()).and_then(|()| updated.save(&self.sites_path)) {
+                Ok(()) => {
+                    self.sites = updated;
+                    self.select(Some(index));
+                }
+                Err(e) => self.error = e,
+            }
         }
         next
     }
@@ -663,18 +766,8 @@ impl App {
         ui.horizontal(|ui| {
             if ui.add(theme::primary_button("", "Save")).clicked() {
                 let result = editor.to_site().and_then(|site| {
-                    let duplicate = updated.sites.iter().enumerate().any(|(i, other)| {
-                        Some(i) != editor.index && other.site == site.site && other.login == site.login
-                    });
-                    if duplicate {
-                        return Err("That site and login already exist.".to_string());
-                    }
                     let key = (site.site.clone(), site.login.clone());
-                    match editor.index {
-                        Some(i) => updated.sites[i] = site,
-                        None => updated.sites.push(site),
-                    }
-                    updated.sites.sort_by(|a, b| (&a.site, &a.login).cmp(&(&b.site, &b.login)));
+                    updated.put(site, editor.index, store::now())?;
                     updated.save(&self.sites_path)?;
                     Ok(updated.sites.iter().position(|s| (&s.site, &s.login) == (&key.0, &key.1)))
                 });
@@ -696,7 +789,7 @@ impl App {
                             editor.confirm_delete = true;
                         }
                     } else if ui.add(theme::danger_button("", "Yes, delete it")).clicked() {
-                        updated.sites.remove(i);
+                        updated.remove(i, store::now());
                         match updated.save(&self.sites_path) {
                             Ok(()) => saved = true,
                             Err(e) => self.error = e,
@@ -781,6 +874,7 @@ impl App {
             }
         }
 
+        let sync_note = self.sync_note();
         let Screen::Settings(settings) = &mut self.screen else {
             return None;
         };
@@ -798,6 +892,15 @@ impl App {
             ui.label(theme::small(
                 "A new device needs only your master password; matching fingerprints show it was typed right.",
             ));
+        });
+
+        theme::card().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(RichText::new("Phone sync").strong());
+            ui.label(theme::small(
+                "Over your local network, between devices with the same master password. Nothing goes through a server.",
+            ));
+            ui.label(theme::small(&sync_note));
         });
 
         theme::card().show(ui, |ui| {
@@ -865,7 +968,69 @@ impl App {
 
     // ---- Frame -------------------------------------------------------------------------------
 
+    /// Starts answering the phone once there are keys, and takes in what a sync changed.
+    fn sync_with_phone(&mut self, ctx: &egui::Context) {
+        if !self.online {
+            return;
+        }
+        match &self.keys {
+            Some(keys) if self.sync.is_none() && self.sync_error.is_none() => {
+                let wake = ctx.clone();
+                let listener = store::listen_for_sync(
+                    store::SYNC_PORT,
+                    rune_core::sync_key(&keys.master),
+                    &fingerprint(&keys.master),
+                    self.sites_path.clone(),
+                    move || wake.request_repaint(),
+                );
+                match listener {
+                    Ok(listener) => self.sync = Some(listener),
+                    Err(e) => self.sync_error = Some(e.to_string()),
+                }
+            }
+            // The keys were removed: stop answering for them.
+            None => (self.sync, self.sync_error) = (None, None),
+            _ => {}
+        }
+
+        for changed in self.sync.iter().flat_map(|listener| listener.synced.try_iter()) {
+            self.synced_at = Some(Instant::now());
+            self.reload_sites |= changed;
+        }
+        // The editor holds an index into the list, so the list stays put while it's open.
+        if self.reload_sites && !matches!(self.screen, Screen::Editor(_)) {
+            self.reload_sites = false;
+            match SiteList::load(&self.sites_path) {
+                Ok(sites) => {
+                    let selected = self.selected.and_then(|i| self.sites.sites.get(i)).map(|s| (s.site.clone(), s.login.clone()));
+                    self.sites = sites;
+                    let position = selected.and_then(|(site, login)| {
+                        self.sites.sites.iter().position(|s| s.site == site && s.login == login)
+                    });
+                    if position != self.selected {
+                        self.select(position);
+                    }
+                }
+                Err(e) => self.error = e,
+            }
+        }
+    }
+
+    /// One line for Settings on where sync stands.
+    fn sync_note(&self) -> String {
+        match (&self.sync_error, self.synced_at) {
+            (Some(e), _) => format!("Not listening for your phone: {e}."),
+            (None, Some(at)) => match at.elapsed().as_secs() / 60 {
+                0 => "Synced with your phone just now.".to_string(),
+                1 => "Synced with your phone a minute ago.".to_string(),
+                minutes => format!("Synced with your phone {minutes} minutes ago."),
+            },
+            (None, None) => "Open Rune on your phone, on this Wi-Fi, and the two site lists become one.".to_string(),
+        }
+    }
+
     fn draw(&mut self, ui: &mut Ui) {
+        self.sync_with_phone(ui.ctx());
         let frame = egui::Frame::new().fill(theme::BG).inner_margin(egui::Margin::same(20));
         egui::CentralPanel::default().frame(frame).show(ui, |ui| {
             // Keep a readable measure on wide windows.
@@ -1000,13 +1165,6 @@ fn display_name(names: &mut HashMap<String, Option<String>>, fetch: bool, ctx: &
     names.get(site).cloned().flatten().unwrap_or_else(|| store::title_case(site))
 }
 
-/// The stored name under a nicer `name` when they differ, then the login: "github.com · bassam".
-fn site_subtitle(name: &str, site: &Site) -> String {
-    let stored = (!name.eq_ignore_ascii_case(&site.site)).then_some(site.site.as_str());
-    let login = (!site.login.is_empty()).then_some(site.login.as_str());
-    stored.into_iter().chain(login).collect::<Vec<_>>().join(" · ")
-}
-
 fn site_row(
     ui: &mut Ui,
     site: &Site,
@@ -1015,7 +1173,7 @@ fn site_row(
     selected: bool,
 ) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 52.0), Sense::click());
-    let subtitle = site_subtitle(name, site);
+    let subtitle = &site.login;
     let label = if subtitle.is_empty() { name.to_owned() } else { format!("{name}, {subtitle}") };
     response.widget_info(|| {
         egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, selected, &label)
@@ -1064,7 +1222,7 @@ fn site_row(
         painter.text(
             egui::pos2(left, rect.center().y + 10.0),
             egui::Align2::LEFT_CENTER,
-            &subtitle,
+            subtitle,
             egui::FontId::proportional(13.0),
             theme::MUTED,
         );

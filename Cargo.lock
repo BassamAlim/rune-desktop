@@ -3355,6 +3355,7 @@ dependencies = [
  "argon2",
  "hex",
  "hmac",
+ "ring",
  "serde",
  "serde_json",
  "sha2",

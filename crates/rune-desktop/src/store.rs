@@ -1,14 +1,17 @@
 //! Everything that touches the machine outside the window: keyring, clipboard, paths, randomness.
 
 use std::collections::HashSet;
-use std::io::Read;
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream, UdpSocket};
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use arboard::{Clipboard, SetExtLinux};
 use eframe::egui;
-use rune_core::Key;
+use rune_core::{Key, SiteList};
 use zeroize::Zeroize;
 
 const SERVICE: &str = "rune";
@@ -54,6 +57,124 @@ pub fn delete_keys(account: &str) -> Result<(), String> {
         Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
         Err(e) => Err(e.to_string()),
     }
+}
+
+/// UDP for being found, TCP for the exchange (SPEC §3.3). Android's `Wire.PORT` is the same.
+pub const SYNC_PORT: u16 = 47825;
+const SYNC_PROBE: &str = "rune-sync/1";
+const SYNC_MAX_BYTES: u32 = 4 * 1024 * 1024;
+
+/// Answering phones for as long as it lives. `synced` gets a message after each exchange:
+/// whether the site list on disk changed.
+pub struct SyncListener {
+    pub synced: Receiver<bool>,
+    stop: Arc<AtomicBool>,
+}
+
+impl Drop for SyncListener {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Lets a phone with the same master password sync over the local network (SPEC §3.3): it
+/// answers that phone's broadcast, then takes its site list, merges it into the file at
+/// `sites_path` and sends the merged list back, both ways sealed under `sync_key`.
+///
+/// The merge happens here, on the file, rather than in the window: a minimised window gets no
+/// frames on Wayland, and sync has to work while Rune sits in the background. `wake` asks the
+/// window to reload.
+// ponytail: a save from the window in the same instant can overwrite a merge. Nothing is lost
+// for good (the phone still has it and the next sync brings it back); a lock shared with the
+// window's saves closes the gap if that ever shows.
+pub fn listen_for_sync(
+    port: u16,
+    sync_key: Key,
+    fingerprint: &str,
+    sites_path: PathBuf,
+    wake: impl Fn() + Send + 'static,
+) -> std::io::Result<SyncListener> {
+    let udp = UdpSocket::bind(("0.0.0.0", port))?;
+    let tcp = TcpListener::bind(("0.0.0.0", port))?;
+    udp.set_read_timeout(Some(Duration::from_secs(1)))?;
+    tcp.set_nonblocking(true)?;
+    let stop = Arc::new(AtomicBool::new(false));
+    let (synced_tx, synced) = mpsc::channel();
+
+    // Found only by a phone that already knows this key's fingerprint.
+    let probe = format!("{SYNC_PROBE} {fingerprint}").into_bytes();
+    let stopped = stop.clone();
+    std::thread::spawn(move || {
+        let mut buffer = [0u8; 64];
+        while !stopped.load(Ordering::Relaxed) {
+            if let Ok((n, from)) = udp.recv_from(&mut buffer)
+                && buffer[..n] == probe[..]
+            {
+                let _ = udp.send_to(&probe, from);
+            }
+        }
+    });
+
+    let stopped = stop.clone();
+    std::thread::spawn(move || {
+        while !stopped.load(Ordering::Relaxed) {
+            match tcp.accept() {
+                Ok((stream, _)) => {
+                    if let Some(changed) = answer_sync(stream, &sync_key, &sites_path) {
+                        let _ = synced_tx.send(changed);
+                        wake();
+                    }
+                }
+                Err(_) => std::thread::sleep(Duration::from_millis(200)),
+            }
+        }
+    });
+    Ok(SyncListener { synced, stop })
+}
+
+/// One exchange: a length and that many sealed bytes each way. `None` for anything that isn't
+/// a phone with this master password, or when the list can't be read or saved: no answer then.
+fn answer_sync(mut stream: TcpStream, sync_key: &Key, sites_path: &std::path::Path) -> Option<bool> {
+    stream.set_nonblocking(false).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
+    stream.set_write_timeout(Some(Duration::from_secs(5))).ok()?;
+
+    let mut length = [0u8; 4];
+    stream.read_exact(&mut length).ok()?;
+    let length = u32::from_be_bytes(length);
+    if length > SYNC_MAX_BYTES {
+        return None;
+    }
+    let mut message = vec![0u8; length as usize];
+    stream.read_exact(&mut message).ok()?;
+    let theirs = rune_core::sync_open(sync_key, &message).ok()?;
+
+    let mine = SiteList::load(sites_path).ok()?;
+    let mut merged = mine.clone();
+    merged.merge(theirs);
+    let changed = merged != mine;
+    if changed {
+        merged.save(sites_path).ok()?;
+    }
+
+    let answer = rune_core::sync_seal(sync_key, &merged, nonce());
+    stream.write_all(&(answer.len() as u32).to_be_bytes()).ok()?;
+    stream.write_all(&answer).ok()?;
+    Some(changed)
+}
+
+/// Seconds since 1970, for stamping changes to the site list (SPEC §3.2).
+pub fn now() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
+}
+
+/// A fresh nonce for sealing a password (§3.1). Never reused: it comes from the kernel's RNG.
+pub fn nonce() -> [u8; 12] {
+    let mut bytes = [0u8; 12];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut bytes))
+        .expect("/dev/urandom is readable");
+    bytes
 }
 
 pub fn random_u16() -> std::io::Result<u16> {

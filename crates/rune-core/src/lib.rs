@@ -162,6 +162,72 @@ pub fn fingerprint(master_key: &Key) -> String {
     format!("{:02x}{:02x}", h[0], h[1])
 }
 
+/// §3.1: the key that seals passwords kept for sites not yet switched to Rune's.
+pub fn seal_key(master_key: &Key) -> Key {
+    hmac(master_key, &[b"rune/v1/seal"])
+}
+
+const SEAL_AAD: &[u8] = b"rune/v1/password";
+const SYNC_AAD: &[u8] = b"rune/v1/sync";
+
+/// AES-256-GCM as nonce ‖ ciphertext ‖ tag. `nonce` must be fresh and random for every call.
+fn aead_seal(key: &Key, aad: &[u8], data: &[u8], nonce: [u8; 12]) -> Vec<u8> {
+    use ring::aead::{AES_256_GCM, Aad, LessSafeKey, Nonce, UnboundKey};
+    let key = LessSafeKey::new(UnboundKey::new(&AES_256_GCM, key).expect("32-byte key"));
+    let mut data = data.to_vec();
+    key.seal_in_place_append_tag(Nonce::assume_unique_for_key(nonce), Aad::from(aad), &mut data)
+        .expect("the data fits in one GCM message");
+    [nonce.as_slice(), &data].concat()
+}
+
+/// `None` on a wrong key or anything damaged or edited.
+fn aead_open(key: &Key, aad: &[u8], bytes: &[u8]) -> Option<Vec<u8>> {
+    use ring::aead::{AES_256_GCM, Aad, LessSafeKey, Nonce, UnboundKey};
+    if bytes.len() < 12 + 16 {
+        return None;
+    }
+    let (nonce, data) = bytes.split_at(12);
+    let key = LessSafeKey::new(UnboundKey::new(&AES_256_GCM, key).expect("32-byte key"));
+    let mut data = data.to_vec();
+    let plain = key.open_in_place(Nonce::try_assume_unique_for_key(nonce).ok()?, Aad::from(aad), &mut data).ok()?;
+    Some(plain.to_vec())
+}
+
+/// §3.1: AES-256-GCM under `seal_key`, as hex of nonce ‖ ciphertext ‖ tag. `nonce` must be
+/// fresh and random for every call.
+pub fn seal(seal_key: &Key, password: &str, nonce: [u8; 12]) -> String {
+    hex::encode(aead_seal(seal_key, SEAL_AAD, password.as_bytes(), nonce))
+}
+
+/// §3.1: the password [`seal`] sealed. Fails on a wrong key or a damaged or edited field.
+pub fn open(seal_key: &Key, sealed: &str) -> Result<String, String> {
+    let bytes = hex::decode(sealed).map_err(|_| "not a sealed password".to_string())?;
+    let plain = aead_open(seal_key, SEAL_AAD, &bytes)
+        .ok_or_else(|| "the stored password can't be opened with this master password".to_string())?;
+    String::from_utf8(plain).map_err(|_| "not a sealed password".to_string())
+}
+
+/// §3.3: what two devices with the same master password prove to each other, and encrypt with.
+pub fn sync_key(master_key: &Key) -> Key {
+    hmac(master_key, &[b"rune/v1/sync"])
+}
+
+/// §3.3: a site list as one sync message.
+pub fn sync_seal(sync_key: &Key, list: &SiteList, nonce: [u8; 12]) -> Vec<u8> {
+    let json = serde_json::to_vec(list).expect("a site list is always JSON");
+    aead_seal(sync_key, SYNC_AAD, &json, nonce)
+}
+
+/// §3.3: the list in a sync message. Fails for a device with a different master password.
+pub fn sync_open(sync_key: &Key, message: &[u8]) -> Result<SiteList, String> {
+    let json = aead_open(sync_key, SYNC_AAD, message).ok_or("not from a device with this master password")?;
+    let list: SiteList = serde_json::from_slice(&json).map_err(|e| e.to_string())?;
+    if list.version != 1 {
+        return Err(format!("unsupported version {}", list.version));
+    }
+    Ok(list)
+}
+
 /// §3
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Site {
@@ -181,6 +247,21 @@ pub struct Site {
     /// not part of the password; absent in files written before it existed.
     #[serde(default)]
     pub note: String,
+    /// §3.1: the site's own password, sealed, until it is changed to Rune's. Empty for most.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub sealed: String,
+    /// §3.2: when this entry was last changed, in seconds since 1970. Zero in older files.
+    #[serde(default)]
+    pub modified: u64,
+}
+
+/// §3.2: an entry that was deleted, remembered so the delete reaches the other device.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Deleted {
+    pub site: String,
+    #[serde(default)]
+    pub login: String,
+    pub modified: u64,
 }
 
 fn default_symbols() -> String {
@@ -191,6 +272,8 @@ fn default_symbols() -> String {
 pub struct SiteList {
     pub version: u32,
     pub sites: Vec<Site>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deleted: Vec<Deleted>,
 }
 
 impl SiteList {
@@ -200,7 +283,7 @@ impl SiteList {
         let text = match std::fs::read_to_string(path) {
             Ok(text) => text,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(Self { version: 1, sites: vec![] });
+                return Ok(Self { version: 1, sites: vec![], deleted: vec![] });
             }
             Err(e) => return Err(format!("{}: {e}", path.display())),
         };
@@ -224,26 +307,84 @@ impl SiteList {
         write().map_err(|e| format!("{}: {e}", path.display()))
     }
 
-    /// Import: merge by `(site, login)`; the higher counter wins.
-    /// Returns how many sites were added and how many were replaced.
+    /// Adds `site`, or replaces the entry at `replacing`. The list stays sorted, a second entry
+    /// for the same site and login is refused, and the change is stamped `now` (§3.2) so it
+    /// wins over older copies on other devices. Renaming leaves a delete for the old name.
+    pub fn put(&mut self, mut site: Site, replacing: Option<usize>, now: u64) -> Result<(), String> {
+        let same = |a: &Site, b: &Site| a.site == b.site && a.login == b.login;
+        if self.sites.iter().enumerate().any(|(i, other)| Some(i) != replacing && same(other, &site)) {
+            return Err("That site and login already exist.".to_string());
+        }
+        let old = replacing.map(|i| self.sites.remove(i));
+        // Later than everything it replaces, even if this device's clock runs behind.
+        let before = old.iter().map(|o| o.modified).chain(self.deleted_at(&site.site, &site.login)).max();
+        site.modified = before.map_or(now, |b| now.max(b + 1));
+        if let Some(old) = old.filter(|old| !same(old, &site)) {
+            self.forget(&old, now);
+        }
+        self.deleted.retain(|d| !(d.site == site.site && d.login == site.login));
+        self.sites.push(site);
+        self.sites.sort_by(|a, b| (&a.site, &a.login).cmp(&(&b.site, &b.login)));
+        Ok(())
+    }
+
+    /// Deletes the entry at `index`, remembering the delete (§3.2).
+    pub fn remove(&mut self, index: usize, now: u64) {
+        let old = self.sites.remove(index);
+        self.forget(&old, now);
+    }
+
+    fn forget(&mut self, old: &Site, now: u64) {
+        self.deleted.retain(|d| !(d.site == old.site && d.login == old.login));
+        self.deleted.push(Deleted { site: old.site.clone(), login: old.login.clone(), modified: now.max(old.modified + 1) });
+    }
+
+    fn deleted_at(&self, site: &str, login: &str) -> Option<u64> {
+        self.deleted.iter().find(|d| d.site == site && d.login == login).map(|d| d.modified)
+    }
+
+    /// §3.2: merges `other` in, for import and sync. Per site and login the newer change wins
+    /// (at a tie, the higher counter, then this list's), a counter never goes down, and a
+    /// delete beats anything older than it. Merging the result back the other way changes
+    /// nothing, so two devices settle. Returns how many sites were added and how many changed.
     pub fn merge(&mut self, other: SiteList) -> (usize, usize) {
-        let (mut added, mut updated) = (0, 0);
-        for mut s in other.sites {
-            s.site = normalize(&s.site);
-            s.login = normalize(&s.login);
-            match self.sites.iter_mut().find(|m| m.site == s.site && m.login == s.login) {
-                Some(mine) if s.counter > mine.counter => {
-                    *mine = s;
-                    updated += 1;
-                }
-                Some(_) => {}
+        use std::collections::BTreeMap;
+        type Key = (String, String);
+        let key = |site: &str, login: &str| -> Key { (normalize(site), normalize(login)) };
+
+        let before: BTreeMap<Key, Site> =
+            std::mem::take(&mut self.sites).into_iter().map(|s| (key(&s.site, &s.login), s)).collect();
+        let mut sites = before.clone();
+        for mut theirs in other.sites {
+            let k = key(&theirs.site, &theirs.login);
+            (theirs.site, theirs.login) = k.clone();
+            match sites.get_mut(&k) {
                 None => {
-                    self.sites.push(s);
-                    added += 1;
+                    sites.insert(k, theirs);
+                }
+                Some(mine) => {
+                    let counter = mine.counter.max(theirs.counter);
+                    if (theirs.modified, theirs.counter) > (mine.modified, mine.counter) {
+                        *mine = theirs;
+                    }
+                    mine.counter = counter;
                 }
             }
         }
-        self.sites.sort_by(|a, b| (&a.site, &a.login).cmp(&(&b.site, &b.login)));
+
+        let mut deleted: BTreeMap<Key, u64> = BTreeMap::new();
+        for d in std::mem::take(&mut self.deleted).into_iter().chain(other.deleted) {
+            let at = deleted.entry(key(&d.site, &d.login)).or_default();
+            *at = (*at).max(d.modified);
+        }
+        // A site changed in the same second as its delete stays: nothing is lost to a tie.
+        sites.retain(|k, site| deleted.get(k).is_none_or(|at| *at <= site.modified));
+        deleted.retain(|k, _| !sites.contains_key(k));
+
+        let added = sites.keys().filter(|k| !before.contains_key(*k)).count();
+        let updated = sites.iter().filter(|(k, site)| before.get(*k).is_some_and(|old| old != *site)).count();
+        self.sites = sites.into_values().collect();
+        self.deleted = deleted.into_iter().map(|((site, login), modified)| Deleted { site, login, modified }).collect();
         (added, updated)
     }
 }
@@ -297,6 +438,24 @@ mod tests {
     }
 
     #[test]
+    fn seal_vector() {
+        let key = seal_key(&[7; 32]);
+        let nonce = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+        let sealed = seal(&key, "Hunter2 – ünïcode", nonce);
+        // Android asserts the same hex: both apps must open each other's files.
+        assert_eq!(
+            sealed,
+            "0102030405060708090a0b0c21bcf4402847d8fc368013cfceee4958760fa13ce5252a5544c5d679c31f12209598356c53"
+        );
+        assert_eq!(open(&key, &sealed).unwrap(), "Hunter2 – ünïcode");
+        assert!(open(&seal_key(&[8; 32]), &sealed).is_err());
+        let mut edited = sealed.clone();
+        edited.replace_range(30..32, if &sealed[30..32] == "00" { "01" } else { "00" });
+        assert!(open(&key, &edited).is_err());
+        assert!(open(&key, "zz").is_err());
+    }
+
+    #[test]
     fn save_then_load() {
         let dir = std::env::temp_dir().join(format!("rune-core-test-{}", std::process::id()));
         let path = dir.join("nested/sites.json");
@@ -307,7 +466,10 @@ mod tests {
                 site: "github.com".into(), login: "bassam".into(), counter: 2,
                 length: 20, classes: "luds".into(), symbols: "-_".into(), apps: vec!["com.github.android".into()],
                 note: "username: bassam_m".into(),
+                sealed: String::new(),
+                modified: 0,
             }],
+            deleted: vec![],
         };
         list.save(&path).unwrap();
         assert_eq!(SiteList::load(&path).unwrap(), list);
@@ -319,17 +481,73 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    #[test]
-    fn merge_higher_counter_wins() {
-        let site = |name: &str, counter| Site {
+    fn site(name: &str, counter: u32, modified: u64) -> Site {
+        Site {
             site: name.into(), login: String::new(), counter,
             length: 20, classes: "luds".into(), symbols: DEFAULT_SYMBOLS.into(), apps: vec![],
-            note: String::new(),
-        };
-        let mut mine = SiteList { version: 1, sites: vec![site("a", 3), site("b", 1)] };
-        let counts = mine.merge(SiteList { version: 1, sites: vec![site("a", 2), site(" B", 2), site("c", 1)] });
+            note: String::new(), sealed: String::new(), modified,
+        }
+    }
+
+    fn list(sites: Vec<Site>) -> SiteList {
+        SiteList { version: 1, sites, deleted: vec![] }
+    }
+
+    #[test]
+    fn merge_higher_counter_wins() {
+        let mut mine = list(vec![site("a", 3, 0), site("b", 1, 0)]);
+        let counts = mine.merge(list(vec![site("a", 2, 0), site(" B", 2, 0), site("c", 1, 0)]));
         assert_eq!(counts, (1, 1));
         assert_eq!(entropy_bits(20, "luds", DEFAULT_SYMBOLS).round(), 125.0);
-        assert_eq!(mine.sites, vec![site("a", 3), site("b", 2), site("c", 1)]);
+        assert_eq!(mine.sites, vec![site("a", 3, 0), site("b", 2, 0), site("c", 1, 0)]);
+    }
+
+    #[test]
+    fn merge_newer_change_wins_but_a_counter_never_goes_down() {
+        let noted = |note: &str, counter, modified| Site { note: note.into(), ..site("a", counter, modified) };
+        let mut mine = list(vec![noted("old", 3, 10)]);
+        assert_eq!(mine.merge(list(vec![noted("new", 1, 20)])), (0, 1));
+        assert_eq!(mine.sites, vec![noted("new", 3, 20)]);
+
+        // The other device, merging the other way, lands on the same list.
+        let mut theirs = list(vec![noted("new", 1, 20)]);
+        theirs.merge(list(vec![noted("old", 3, 10)]));
+        assert_eq!(theirs, mine);
+        assert_eq!(theirs.clone().merge(mine.clone()), (0, 0));
+    }
+
+    #[test]
+    fn deletes_and_renames_travel() {
+        let mut phone = list(vec![site("a", 1, 10), site("b", 1, 10)]);
+        let mut desktop = phone.clone();
+
+        phone.remove(0, 20);
+        phone.put(site("c", 1, 0), Some(0), 20).unwrap(); // "b" renamed to "c"
+        assert_eq!(phone.sites.iter().map(|s| s.site.as_str()).collect::<Vec<_>>(), ["c"]);
+
+        desktop.merge(phone.clone());
+        assert_eq!(desktop, phone);
+
+        // Added again later, it comes back everywhere, and the delete is forgotten.
+        desktop.put(site("a", 1, 0), None, 15).unwrap();
+        assert_eq!(desktop.sites[0].modified, 21, "later than the delete, whatever the clock says");
+        phone.merge(desktop.clone());
+        assert_eq!(phone, desktop);
+        assert!(phone.deleted.iter().all(|d| d.site != "a"));
+
+        assert!(phone.put(site("c", 1, 0), None, 30).is_err(), "no second entry for one account");
+    }
+
+    const SYNC_VECTOR: &str = "09090909090909090909090932c1ac9a31895ff6306e6f7139af6044bbaa5e2cd5af2f8be8722941db67734bc975fc8e3619d2fb92cd3ff5a4c822cd5e61945fc01acfc418438359b6d0a1381a3d6f376ef1a852c31477de98766e8aade92939144510ff34acca16cb79a7f6c37bff0d819279badb8e64b6f4d221b33f864606b5381b087f1baec866e03cc83fc6d59caa6d89de6db37d88967e9e2fd719d1e02c5ed656cf2247636d4f77c55f738f73";
+
+    #[test]
+    fn sync_messages_open_only_with_the_same_master() {
+        let key = sync_key(&[7; 32]);
+        let sent = list(vec![site("a", 1, 10)]);
+        let message = sync_seal(&key, &sent, [9; 12]);
+        assert_eq!(sync_open(&key, &message).unwrap(), sent);
+        assert!(sync_open(&sync_key(&[8; 32]), &message).is_err());
+        // Android's SyncTest opens this exact message.
+        assert_eq!(hex::encode(&message), SYNC_VECTOR);
     }
 }

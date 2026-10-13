@@ -1,6 +1,7 @@
 # Rune — spec v1
 
-Deterministic password generator. Same inputs, same password; no passwords are ever stored.
+Deterministic password generator. Same inputs, same password; Rune's passwords are never stored.
+The one exception is temporary: a site's old password, sealed (§3.1), until it is changed to Rune's.
 
 Two private GitHub repos, personal use only:
 
@@ -113,16 +114,65 @@ Not secret, but required: a lost counter or policy means a lost password.
   "sites": [
     { "site": "github.com", "login": "bassam", "counter": 1,
       "length": 16, "classes": "luds", "symbols": "!@#$%^&*-_=+?",
-      "apps": ["com.github.android"], "note": "username: bassam_m" }
-  ]
+      "apps": ["com.github.android"], "note": "username: bassam_m", "modified": 1760300000 }
+  ],
+  "deleted": [ { "site": "old.example", "login": "", "modified": 1760300100 } ]
 }
 ```
 
 - `symbols` is stored in canonical order and may be absent (files from before it existed): absent means the default.
 - `note` is free text kept with the login (e.g. a username when the login is an email), stored as typed. Not secret, not part of the password; absent means empty.
+- `sealed` is a site's own password kept until it is changed to Rune's (§3.1); absent or empty for most sites.
+
+### 3.1 Kept passwords
+
+For moving in from another password manager: a site keeps its existing password until the user
+changes it on the site to Rune's, then switches, which deletes it.
+
+```
+sealKey = HMAC-SHA256(masterKey, "rune/v1/seal")
+sealed  = hex( nonce ‖ AES-256-GCM(sealKey, nonce, UTF-8 password, aad = "rune/v1/password") )
+```
+
+- `nonce` is 12 random bytes, fresh for every seal; the GCM tag is 16 bytes.
+- Not bound to the site or login, so renaming an entry keeps it readable. Editing a site carries it through untouched.
+- While kept, it is the site's password everywhere (shown, copied, autofilled); Rune's is offered beside it for the site's change-password form.
+- Set and opened only after an unlock: on Android the site screen holds `sealKey` (never the master key) while the password is shown and zeroes it on leaving.
+- Both apps assert one vector (`seal_vector` in rune-core, `SealTest` on Android): master key `[7; 32]`, nonce `01..0c`, password `Hunter2 – ünïcode`.
 - One JSON file in app-private storage; the same format is the export/import file.
-- Export and import are manual, through the system file picker. Import merges by `(site, login)`; the higher counter wins.
-- The same file moves the list between phone and desktop.
+- `modified` is when the entry last changed, in seconds since 1970; absent (older files) means 0. `deleted` remembers deletes; absent means none.
+- Export and import are manual, through the system file picker. Import merges (§3.2).
+- The same file moves the list between phone and desktop, and so does sync (§3.3).
+
+### 3.2 Merging two lists
+
+One rule for import and for sync, per `(site, login)` after normalising both:
+
+- The entry with the larger `modified` wins whole. At a tie the higher counter wins; at a full tie the list being merged into keeps its own.
+- The counter of the result is the higher of the two, whichever entry won: a counter never goes down, because a lost higher counter is a lost password.
+- A delete removes an entry whose `modified` is older than it. An entry changed in the same second or later stays, and the delete is dropped.
+- Every save stamps `modified = max(now, what it replaces + 1)`, counting a remembered delete of the same name, so a change always beats what it changed even on a device whose clock runs behind. A delete is stamped the same way. Renaming an entry is a delete of the old name and a save of the new.
+
+Merging A into B and B into A gives the same list, and merging again changes nothing, so two devices settle after one exchange.
+
+### 3.3 Sync over the local network
+
+The phone and the desktop keep their lists the same when both are on one network. There is no server and no pairing: both already hold the master key.
+
+```
+syncKey = HMAC-SHA256(masterKey, "rune/v1/sync")
+message = nonce ‖ AES-256-GCM(syncKey, nonce, UTF-8 JSON site list, aad = "rune/v1/sync")
+```
+
+1. **Find.** The phone sends the UDP datagram `rune-sync/1 <fingerprint>` (§2.4) to the broadcast address of each network it is on, port 47825. A desktop holding a key with that fingerprint sends the same bytes back; any other stays silent.
+2. **Exchange.** The phone connects to that address on TCP 47825 and sends its list as one `message`, prefixed by its length as a 4-byte big-endian integer (at most 4 MiB). The desktop opens it, merges it into its own list (§3.2), saves, and answers with the merged list in the same framing. The phone merges the answer into its own.
+
+- Only a device with the same master password can produce or open a message. One with another password gets no answer and changes nothing.
+- A replayed or reflected message is harmless: merging an old list, or one's own, changes nothing (§3.2).
+- The phone syncs when the app comes to the front, after every change, and on request. The desktop only answers, for as long as it is running, including minimised: the merge is done on the file by the listener, not by the window.
+- The phone keeps `syncKey` in app-private storage so sync needs no unlock. It is one-way from the master key and opens no password (kept ones are sealed under a different key, §3.1); it protects only the list in transit, which the phone already stores in the clear.
+- On Android 17+ the phone needs the `ACCESS_LOCAL_NETWORK` permission, asked for on "Sync now".
+- Both apps assert one message (`sync_messages_open_only_with_the_same_master` in rune-core, `SyncTest` on Android).
 
 ## 4. Android
 
@@ -162,7 +212,7 @@ with type-safe routes, one `StateFlow<UiState>` per ViewModel.
 
 ### 4.5 Hardening
 
-- `INTERNET` only to fetch each site's `https://<site>/favicon.ico` and homepage, for its avatar and a display name (both apps do this; the stored name and the password never change). The request carries the site name and nothing else; no secret or derived value is ever sent. `FLAG_SECURE` on both activities. `allowBackup="false"` and everything excluded from device transfer.
+- `INTERNET` only to fetch each site's `https://<site>/favicon.ico` and homepage, for its avatar and a display name (both apps do this; the stored name and the password never change), and to sync with the desktop on the local network (§3.3). The request carries the site name and nothing else; no secret or derived value is ever sent. `FLAG_SECURE` on both activities. `allowBackup="false"` and everything excluded from device transfer.
 
 ### 4.6 Stack
 
