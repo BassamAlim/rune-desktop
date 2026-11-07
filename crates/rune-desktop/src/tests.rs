@@ -322,11 +322,27 @@ fn a_finger_unlocks_and_another_doesnt() {
 }
 
 #[test]
+fn the_card_copies_the_password_in_one_click() {
+    let mut app = app_with_keys(temp_dir("one-click").join("sites.json"));
+    app.sites.sites = vec![site("github.com", "bassam")];
+    app.selected = Some(0);
+    app.screen = Screen::Sites;
+    let mut harness = harness(app, Harness::builder());
+    harness.get_by_label("Copy username");
+    click(&mut harness, "Copy password");
+    assert!(matches!(harness.state().asking.as_ref().unwrap().purpose, Purpose::Show { copy: true, .. }));
+    harness.state_mut().asking = None;
+    harness.run();
+    click(&mut harness, "Show password");
+    assert!(matches!(harness.state().asking.as_ref().unwrap().purpose, Purpose::Show { copy: false, .. }));
+}
+
+#[test]
 fn locks_when_idle_forgetting_what_was_revealed() {
     let mut app = app_with_keys(temp_dir("forget").join("sites.json"));
     app.sites.sites = vec![site("github.com", ""), site("b.example", "")];
     app.select(Some(0));
-    app.ask(Purpose::Show { site: "github.com".into(), login: "".into() });
+    app.ask(Purpose::Show { site: "github.com".into(), login: "".into(), copy: false });
     answer(&mut app);
     app.show_password = true;
     let ctx = egui::Context::default();
@@ -338,7 +354,7 @@ fn locks_when_idle_forgetting_what_was_revealed() {
     assert!(app.revealed.is_none(), "another site forgets it");
 
     app.select(Some(0));
-    app.ask(Purpose::Show { site: "github.com".into(), login: "".into() });
+    app.ask(Purpose::Show { site: "github.com".into(), login: "".into(), copy: false });
     answer(&mut app);
     app.active_at = SystemTime::now() - LOCK_AFTER;
     app.lock_when_idle(&ctx);
@@ -682,13 +698,13 @@ fn screenshots() {
         app.select(Some(1));
         let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
         app.sync = store::listen_for_sync(port, [0; 32], "test", dir.join("unused.json"), || {}).ok();
-        app.ask(Purpose::Show { site: sites[1].site.clone(), login: sites[1].login.clone() });
+        app.ask(Purpose::Show { site: sites[1].site.clone(), login: sites[1].login.clone(), copy: false });
         app.asking.as_mut().unwrap().code = Some("437923".into());
     });
     shoot("4d-master", &|app| {
         app.sites.sites = sites.clone();
         app.select(Some(1));
-        app.ask(Purpose::Show { site: sites[1].site.clone(), login: sites[1].login.clone() });
+        app.ask(Purpose::Show { site: sites[1].site.clone(), login: sites[1].login.clone(), copy: false });
     });
     shoot("1-setup", &|app| {
         app.stored = None;
@@ -703,15 +719,23 @@ fn screenshots() {
     shoot("4-sites", &|app| {
         app.sites.sites = sites.clone();
         app.select(Some(1));
-        app.ask(Purpose::Show { site: app.sites.sites[1].site.clone(), login: app.sites.sites[1].login.clone() });
+        app.ask(Purpose::Show { site: app.sites.sites[1].site.clone(), login: app.sites.sites[1].login.clone(), copy: false });
         answer(app);
         app.show_password = true;
+    });
+    shoot("4a-card", &|app| {
+        app.sites.sites = sites.clone();
+        app.select(Some(1));
+    });
+    shoot("4a-card-long", &|app| {
+        app.sites.sites = sites.clone();
+        app.select(Some(3));
     });
     shoot("4b-kept", &|app| {
         app.sites.sites = sites.clone();
         app.sites.sites[1].sealed = rune_core::seal(&rune_core::seal_key(&MASTER), "Hunter2!", [0; 12]);
         app.select(Some(1));
-        app.ask(Purpose::Show { site: app.sites.sites[1].site.clone(), login: app.sites.sites[1].login.clone() });
+        app.ask(Purpose::Show { site: app.sites.sites[1].site.clone(), login: app.sites.sites[1].login.clone(), copy: false });
         answer(app);
         app.show_password = true;
     });

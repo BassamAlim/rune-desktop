@@ -143,7 +143,8 @@ struct Settings {
 
 /// What a request to the phone is for.
 enum Purpose {
-    Show { site: String, login: String },
+    /// `copy`: put the password on the clipboard as soon as it comes back.
+    Show { site: String, login: String, copy: bool },
     Keep(ToKeep),
     /// A Bitwarden export, and what of it was left out, for the message afterwards.
     Import { items: Vec<ToKeep>, skipped: String },
@@ -152,7 +153,7 @@ enum Purpose {
 impl Purpose {
     fn to_ask(&self) -> store::Ask {
         match self {
-            Purpose::Show { site, login } => store::Ask::Show { site: site.clone(), login: login.clone() },
+            Purpose::Show { site, login, .. } => store::Ask::Show { site: site.clone(), login: login.clone() },
             Purpose::Keep(item) => store::Ask::Keep(vec![item.clone()]),
             Purpose::Import { items, .. } => store::Ask::Import(items.clone()),
         }
@@ -161,7 +162,7 @@ impl Purpose {
     /// Asked from this site's card.
     fn is_for(&self, entry: &Site) -> bool {
         match self {
-            Purpose::Show { site, login } => *site == entry.site && *login == entry.login,
+            Purpose::Show { site, login, .. } => *site == entry.site && *login == entry.login,
             Purpose::Keep(item) => item.site.site == entry.site && item.site.login == entry.login,
             Purpose::Import { .. } => false,
         }
@@ -237,6 +238,7 @@ struct App {
     confirm_switch: bool,
     clipboard: Option<Clipboard>,
     copied_at: Option<Instant>,
+    login_copied_at: Option<Instant>,
     /// Favicons and their tile colours by site name, once settled; `None` for a site that has none.
     icons: HashMap<String, Option<(egui::TextureHandle, egui::Color32)>>,
     /// Names sites give themselves ("GitHub"), once settled; `None` for a site that gives none.
@@ -287,6 +289,7 @@ impl App {
             confirm_switch: false,
             clipboard: None,
             copied_at: None,
+            login_copied_at: None,
         };
         match SiteList::load(&app.sites_path) {
             Ok(sites) => app.sites = sites,
@@ -605,6 +608,21 @@ impl App {
         }
     }
 
+    /// A username isn't secret: a plain copy that stays in history and isn't cleared.
+    fn copy_login(&mut self, login: &str) {
+        if self.clipboard.is_none() {
+            self.clipboard = Clipboard::new().ok();
+        }
+        match self.clipboard.as_mut().map(|c| c.set_text(login)) {
+            Some(Ok(())) => {
+                self.login_copied_at = Some(Instant::now());
+                self.error.clear();
+            }
+            Some(Err(e)) => self.error = format!("Can't copy: {e}"),
+            None => self.error = "Can't copy: no clipboard available".into(),
+        }
+    }
+
     fn select(&mut self, index: Option<usize>) {
         let entry = index.and_then(|i| self.sites.sites.get(i));
         // What was revealed or asked for another site goes; the same site, re-selected after a
@@ -619,6 +637,7 @@ impl App {
         }
         self.selected = index;
         self.copied_at = None;
+        self.login_copied_at = None;
         if let Some(mut typed) = self.keeping.take() {
             typed.zeroize();
         }
@@ -736,7 +755,19 @@ impl App {
                 ui.vertical(|ui| {
                     ui.label(RichText::new(&name).strong().size(16.0));
                     if !subtitle.is_empty() {
-                        ui.label(theme::small(subtitle));
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(theme::small(subtitle));
+                            let just = self.login_copied_at.is_some_and(|at| at.elapsed() < COPIED_FLASH);
+                            let (glyph, text) = if just { (icon::CHECK, "Copied") } else { (icon::COPY, "Copy") };
+                            let copy = ui.add(theme::button(glyph, text).small()).on_hover_text("Copy username");
+                            copy.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Copy username"));
+                            if copy.clicked() {
+                                self.copy_login(&site.login);
+                            }
+                            if just {
+                                ui.ctx().request_repaint_after(COPIED_FLASH);
+                            }
+                        });
                     }
                     if !site.note.is_empty() {
                         ui.label(&site.note);
@@ -753,8 +784,20 @@ impl App {
                 self.asking_panel(ui);
             } else if let Some(revealed) = &revealed {
                 self.revealed_password(ui, revealed, &mut new_sealed);
-            } else if ui.add_sized([ui.available_width(), 40.0], theme::primary_button(icon::EYE, "Show password")).clicked() {
-                self.ask(Purpose::Show { site: site.site.clone(), login: site.login.clone() });
+            } else {
+                let mut ask = None;
+                ui.columns(2, |cols| {
+                    let full = [cols[0].available_width(), 40.0];
+                    if cols[0].add_sized(full, theme::primary_button(icon::COPY, "Copy password")).clicked() {
+                        ask = Some(true);
+                    }
+                    if cols[1].add_sized(full, theme::button(icon::EYE, "Show password")).clicked() {
+                        ask = Some(false);
+                    }
+                });
+                if let Some(copy) = ask {
+                    self.ask(Purpose::Show { site: site.site.clone(), login: site.login.clone(), copy });
+                }
             }
 
             // §3.1: keeping the site's own password until it is changed to Rune's.
@@ -928,7 +971,7 @@ impl App {
             return Approval::Failed("nothing was asked".into());
         };
         let result = match &asking.purpose {
-            Purpose::Show { site, login } => match self.sites.sites.iter().find(|s| s.site == *site && s.login == *login) {
+            Purpose::Show { site, login, .. } => match self.sites.sites.iter().find(|s| s.site == *site && s.login == *login) {
                 Some(entry) => reveal(master, entry).map(Approval::Revealed),
                 None => Ok(Approval::Missing),
             },
@@ -943,7 +986,10 @@ impl App {
             return;
         };
         match (asking.purpose, outcome) {
-            (Purpose::Show { site, login }, Approval::Revealed(revealed)) => {
+            (Purpose::Show { site, login, copy }, Approval::Revealed(revealed)) => {
+                if copy {
+                    self.copy(revealed.kept.as_ref().unwrap_or(&revealed.password).clone());
+                }
                 self.revealed = Some((site, login, revealed));
                 self.show_password = false;
                 self.active_at = SystemTime::now();
