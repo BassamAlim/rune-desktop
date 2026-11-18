@@ -32,3 +32,4 @@ jobs:
         with:
           name: rune-desktop-linux-x86_64
           path: target/release/rune-desktop
+          retention-days: 7
